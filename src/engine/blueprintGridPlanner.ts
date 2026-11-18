@@ -287,6 +287,57 @@ interface TileBox {
   maxY: number;
 }
 
+function forEachSegmentVoxel(
+  pivots: Vec3[],
+  fn: (x: number, y: number, z: number) => void,
+): void {
+  if (pivots.length === 0) return;
+  fn(pivots[0][0], pivots[0][1], pivots[0][2]);
+  for (let i = 1; i < pivots.length; i++) {
+    const [x1, y1, z1] = pivots[i - 1];
+    const [x2, y2, z2] = pivots[i];
+    const sx = sign(x2 - x1);
+    const sy = sign(y2 - y1);
+    const sz = sign(z2 - z1);
+    let x = x1 + sx;
+    let y = y1 + sy;
+    let z = z1 + sz;
+    const steps =
+      Math.abs(x2 - x1) + Math.abs(y2 - y1) + Math.abs(z2 - z1);
+    for (let s = 0; s < steps; s++) {
+      fn(x, y, z);
+      x += sx;
+      y += sy;
+      z += sz;
+    }
+  }
+}
+
+function countVoxelConflicts(
+  pts: Vec3[],
+  productId: string,
+  voxelProduct: Map<string, string>,
+): number {
+  let conflicts = 0;
+  forEachSegmentVoxel(pts, (x, y, z) => {
+    const owner = voxelProduct.get(`${x},${y},${z}`);
+    if (owner !== undefined && owner !== productId) {
+      conflicts++;
+    }
+  });
+  return conflicts;
+}
+
+function recordRouteVoxels(
+  pts: Vec3[],
+  productId: string,
+  voxelProduct: Map<string, string>,
+): void {
+  forEachSegmentVoxel(pts, (x, y, z) => {
+    voxelProduct.set(`${x},${y},${z}`, productId);
+  });
+}
+
 function countBoxCollisions(pts: Vec3[], boxes: TileBox[]): number {
   if (boxes.length === 0) return 0;
   let hits = 0;
@@ -327,7 +378,9 @@ export function routePortToPort(
   zLevel = 0,
   kind: Exclude<LogisticsSummary['kind'], 'virtual'> = 'flat',
   blockedBoxes: TileBox[] = [],
-): { startDir: Vec3; endDir: Vec3; pivots: Vec3[]; zLevel: number } | null {
+  productId?: string,
+  voxelProduct?: Map<string, string>,
+): { startDir: Vec3; endDir: Vec3; pivots: Vec3[]; zLevel: number; voxelConflicts: number; boxCollisions: number } | null {
   const startDir: Vec3 = [-sign(sp.dirX), -sign(sp.dirY), 0];
   const endDir: Vec3 = [-sign(dp.dirX), -sign(dp.dirY), 0];
 
@@ -345,6 +398,43 @@ export function routePortToPort(
 
   const candidates: Vec3[][] = [];
   const detourList = Array.isArray(detourY) ? detourY : [detourY];
+
+  const state: {
+    best: Vec3[] | null;
+    score: number;
+    voxelHits: number;
+    boxHits: number;
+  } = {
+    best: null,
+    score: Infinity,
+    voxelHits: 0,
+    boxHits: 0,
+  };
+
+  // Evaluate fast direct + corridor candidates first; only scan full Y-alley detours when blocked
+  const evaluateCandidates = (cands: Vec3[][]) => {
+    for (const cand of cands) {
+      const valid = simplifyAndValidatePivots(cand, startDir, endDir);
+      if (!valid) continue;
+      const collisions = countBoxCollisions(valid, blockedBoxes);
+      if (state.best !== null && collisions > state.boxHits) continue;
+      const voxelHits =
+        productId && voxelProduct
+          ? countVoxelConflicts(valid, productId, voxelProduct)
+          : 0;
+      const score =
+        collisions * 1_000_000 +
+        voxelHits * 100_000 +
+        manhattanLen(valid) +
+        valid.length * 0.5;
+      if (score < state.score) {
+        state.score = score;
+        state.best = valid;
+        state.voxelHits = voxelHits;
+        state.boxHits = collisions;
+      }
+    }
+  };
 
   if (kind === 'fluid' && (sz !== targetZ || dz !== targetZ)) {
     const p0z: Vec3 = [p0[0], p0[1], targetZ];
@@ -369,138 +459,126 @@ export function routePortToPort(
       return res;
     };
 
-    // Direct at elevated targetZ
-    candidates.push(wrap([]));
-    candidates.push(wrap([[q0z[0], p0z[1], targetZ]]));
-    candidates.push(wrap([[p0z[0], q0z[1], targetZ]]));
-
-    // Via corridorX at targetZ (direct & stepped)
-    candidates.push(
+    const fastCands: Vec3[][] = [
+      wrap([]),
+      wrap([[q0z[0], p0z[1], targetZ]]),
+      wrap([[p0z[0], q0z[1], targetZ]]),
       wrap([
         [corridorX, p0z[1], targetZ],
         [corridorX, q0z[1], targetZ],
       ]),
-    );
-    candidates.push(
       wrap([
         p1z,
         [corridorX, p1z[1], targetZ],
         [corridorX, q1z[1], targetZ],
         q1z,
       ]),
-    );
-    candidates.push(wrap([p1z, [p1z[0], q1z[1], targetZ], q1z]));
-    candidates.push(wrap([p1z, [q1z[0], p1z[1], targetZ], q1z]));
+      wrap([p1z, [p1z[0], q1z[1], targetZ], q1z]),
+      wrap([p1z, [q1z[0], p1z[1], targetZ], q1z]),
+    ];
+    evaluateCandidates(fastCands);
 
-    // Alley / bypass detours avoiding buildings
-    const xs = [
-      corridorX,
-      Math.min(p1z[0], q1z[0]) - 2,
-      Math.max(p1z[0], q1z[0]) + 2,
-    ];
-    const ys = [
-      ...detourList,
-      Math.min(p1z[1], q1z[1]) - 3,
-      Math.max(p1z[1], q1z[1]) + 3,
-    ];
-    for (const mx of xs) {
-      for (const my of ys) {
-        candidates.push(
-          wrap([
-            p1z,
-            [p1z[0], my, targetZ],
-            [mx, my, targetZ],
-            [mx, q1z[1], targetZ],
-            q1z,
-          ]),
-        );
-        candidates.push(
-          wrap([
-            p1z,
-            [mx, p1z[1], targetZ],
-            [mx, my, targetZ],
-            [q1z[0], my, targetZ],
-            q1z,
-          ]),
-        );
-        candidates.push(
-          wrap([
-            [p0z[0], my, targetZ],
-            [q0z[0], my, targetZ],
-          ]),
-        );
+    if (!state.best || state.boxHits > 0 || state.voxelHits > 0) {
+      const lowY = Math.min(p1z[1], q1z[1]) - 3;
+      const highY = Math.max(p1z[1], q1z[1]) + 3;
+      const midY = (p1z[1] + q1z[1]) / 2;
+      const nearAlleys = [...detourList]
+        .sort((a, b) => Math.abs(a - midY) - Math.abs(b - midY))
+        .slice(0, 8);
+      const outerAlleys = [
+        detourList[0],
+        detourList[1],
+        detourList[detourList.length - 2],
+        detourList[detourList.length - 1],
+      ].filter((v) => v !== undefined);
+      const xs = [...new Set([
+        corridorX,
+        corridorX - 1,
+        corridorX + 1,
+        Math.min(p1z[0], q1z[0]) - 2,
+        Math.max(p1z[0], q1z[0]) + 2,
+      ])];
+      const ys = [...new Set([...nearAlleys, ...outerAlleys, lowY, lowY - 2, highY, highY + 2])];
+      for (const mx of xs) {
+        for (const my of ys) {
+          candidates.push(
+            wrap([
+              p1z,
+              [p1z[0], my, targetZ],
+              [mx, my, targetZ],
+              [mx, q1z[1], targetZ],
+              q1z,
+            ]),
+            wrap([
+              p1z,
+              [mx, p1z[1], targetZ],
+              [mx, my, targetZ],
+              [q1z[0], my, targetZ],
+              q1z,
+            ]),
+            wrap([
+              [p0z[0], my, targetZ],
+              [q0z[0], my, targetZ],
+            ]),
+          );
+        }
       }
+      evaluateCandidates(candidates);
     }
   } else {
     const z = sz;
     const p1: Vec3 = [sp.connX + sign(sp.dirX), sp.connY + sign(sp.dirY), z];
     const q1: Vec3 = [dp.connX + sign(dp.dirX), dp.connY + sign(dp.dirY), z];
 
-    // 1. Direct orthogonal 2 or 3 pivot connection
-    candidates.push([p0, q0]);
-    candidates.push([p0, [q0[0], p0[1], z], q0]);
-    candidates.push([p0, [p0[0], q0[1], z], q0]);
+    const fastCands: Vec3[][] = [
+      [p0, q0],
+      [p0, [q0[0], p0[1], z], q0],
+      [p0, [p0[0], q0[1], z], q0],
+      [p0, p1, [corridorX, p1[1], z], [corridorX, q1[1], z], q1, q0],
+      [p0, p1, [p1[0], q1[1], z], q1, q0],
+      [p0, p1, [q1[0], p1[1], z], q1, q0],
+    ];
+    evaluateCandidates(fastCands);
 
-    // 2. Stepped 1-tile out + corridorX + step into port
-    candidates.push([
-      p0,
-      p1,
-      [corridorX, p1[1], z],
-      [corridorX, q1[1], z],
-      q1,
-      q0,
-    ]);
-    candidates.push([p0, p1, [p1[0], q1[1], z], q1, q0]);
-    candidates.push([p0, p1, [q1[0], p1[1], z], q1, q0]);
-
-    // 3. Corridor via Y alleys (avoids building bounding boxes & handles N/S/reversed ports)
-    const leftClearX = Math.min(p1[0], q1[0]) - 2;
-    const rightClearX = Math.max(p1[0], q1[0]) + 2;
-    const lowY = Math.min(p1[1], q1[1]) - 3;
-    const highY = Math.max(p1[1], q1[1]) + 3;
-    const xs = [corridorX, leftClearX, rightClearX];
-    const ys = [...detourList, lowY, highY];
-    for (const mx of xs) {
-      for (const my of ys) {
-        candidates.push([
-          p0,
-          p1,
-          [p1[0], my, z],
-          [mx, my, z],
-          [mx, q1[1], z],
-          q1,
-          q0,
-        ]);
-        candidates.push([
-          p0,
-          p1,
-          [mx, p1[1], z],
-          [mx, my, z],
-          [q1[0], my, z],
-          q1,
-          q0,
-        ]);
+    if (!state.best || state.boxHits > 0 || state.voxelHits > 0) {
+      const leftClearX = Math.min(p1[0], q1[0]) - 2;
+      const rightClearX = Math.max(p1[0], q1[0]) + 2;
+      const lowY = Math.min(p1[1], q1[1]) - 3;
+      const highY = Math.max(p1[1], q1[1]) + 3;
+      const midY = (p1[1] + q1[1]) / 2;
+      const nearAlleys = [...detourList]
+        .sort((a, b) => Math.abs(a - midY) - Math.abs(b - midY))
+        .slice(0, 8);
+      const outerAlleys = [
+        detourList[0],
+        detourList[1],
+        detourList[detourList.length - 2],
+        detourList[detourList.length - 1],
+      ].filter((v) => v !== undefined);
+      const xs = [...new Set([corridorX, corridorX - 1, corridorX + 1, leftClearX, rightClearX])];
+      const ys = [...new Set([...nearAlleys, ...outerAlleys, lowY, lowY - 2, highY, highY + 2])];
+      for (const mx of xs) {
+        for (const my of ys) {
+          candidates.push(
+            [p0, p1, [p1[0], my, z], [mx, my, z], [mx, q1[1], z], q1, q0],
+            [p0, p1, [mx, p1[1], z], [mx, my, z], [q1[0], my, z], q1, q0],
+          );
+        }
       }
+      evaluateCandidates(candidates);
     }
   }
 
-  let best: Vec3[] | null = null;
-  let bestScore = Infinity;
-
-  for (const cand of candidates) {
-    const valid = simplifyAndValidatePivots(cand, startDir, endDir);
-    if (!valid) continue;
-    const collisions = countBoxCollisions(valid, blockedBoxes);
-    const score = collisions * 10000 + manhattanLen(valid) + valid.length * 0.5;
-    if (score < bestScore) {
-      bestScore = score;
-      best = valid;
-    }
-  }
-
-  if (!best) return null;
-  const maxZ = best.reduce((m, pt) => Math.max(m, pt[2]), 0);
-  return { startDir, endDir, pivots: best, zLevel: maxZ };
+  if (!state.best) return null;
+  const maxZ = state.best.reduce((m, pt) => Math.max(m, pt[2]), 0);
+  return {
+    startDir,
+    endDir,
+    pivots: state.best,
+    zLevel: maxZ,
+    voxelConflicts: state.voxelHits,
+    boxCollisions: state.boxHits,
+  };
 }
 
 function makePlacedBuilding(
@@ -963,7 +1041,14 @@ export function buildCompactGridLayout(
   }
 
   // Collect horizontal Y-alleys between stacked buildings + global top/bottom bypass lanes
-  const alleyYSet = new Set<number>([globalMinY - 3, globalMaxY + 3]);
+  const alleyYSet = new Set<number>([
+    globalMinY - 3,
+    globalMinY - 5,
+    globalMinY - 7,
+    globalMaxY + 3,
+    globalMaxY + 5,
+    globalMaxY + 7,
+  ]);
   for (let c = 0; c < allColumns.length; c++) {
     const colBlds = allColumns[c]
       .map((item) => buildings.find((b) => b.id === item.id))
@@ -1126,15 +1211,16 @@ export function buildCompactGridLayout(
     }
   }
 
-  // Pass 2: Group connections into material-isolated corridor streams with dedicated (laneX, zLevel)
+  // Pass 2: Group connections into material-isolated corridor streams & endpoint-connected components
   interface MaterialStream {
     key: string;
     corridorIdx: number;
     productId: string;
     kind: Exclude<LogisticsSummary['kind'], 'virtual'>;
     conns: PlannedConn[];
-    laneX: number;
-    zLevel: number;
+    laneStart: number;
+    laneSpan: number;
+    baseLaneOffset: number;
   }
 
   const streamMap = new Map<string, MaterialStream>();
@@ -1144,14 +1230,21 @@ export function buildCompactGridLayout(
     const sKey = `${conn.corridorIdx}::${conn.productId}`;
     let stream = streamMap.get(sKey);
     if (!stream) {
+      const leftEndX = colRanges[conn.corridorIdx]?.endX ?? START_X;
+      const rightStartX =
+        colRanges[conn.corridorIdx + 1]?.startX ?? leftEndX + CORRIDOR_X + 1;
+      const laneStart = leftEndX + 5;
+      const laneEnd = Math.max(laneStart, rightStartX - 5);
+      const laneSpan = Math.max(1, laneEnd - laneStart + 1);
       stream = {
         key: sKey,
         corridorIdx: conn.corridorIdx,
         productId: conn.productId,
         kind: conn.kind,
         conns: [],
-        laneX: 0,
-        zLevel: 0,
+        laneStart,
+        laneSpan,
+        baseLaneOffset: 0,
       };
       streamMap.set(sKey, stream);
       const list = streamsByCorridor.get(conn.corridorIdx) ?? [];
@@ -1161,87 +1254,55 @@ export function buildCompactGridLayout(
     stream.conns.push(conn);
   }
 
-  // Assign distinct (laneX, zLevel) per stream within each corridor
-  for (const [cIdx, list] of streamsByCorridor.entries()) {
-    // Stable sort: molten first (z=0), then flat/loose solids (z=0..4), then fluids above (z=2..5)
+  for (const list of streamsByCorridor.values()) {
     list.sort((a, b) => {
       const rank = (k: MaterialStream['kind']) =>
         k === 'molten' ? 0 : k === 'fluid' ? 2 : 1;
       const dr = rank(a.kind) - rank(b.kind);
       return dr !== 0 ? dr : a.productId.localeCompare(b.productId);
     });
-
-    const leftEndX = colRanges[cIdx]?.endX ?? START_X;
-    const rightStartX = colRanges[cIdx + 1]?.startX ?? leftEndX + CORRIDOR_X + 1;
-    const laneStart = leftEndX + 5;
-    const laneEnd = Math.max(laneStart, rightStartX - 5);
-    const laneSpan = Math.max(1, laneEnd - laneStart + 1);
-
-    let solidZCursor = list.some((s) => s.kind === 'molten') ? 1 : 0;
-    const usedSolidZs = new Set<number>(solidZCursor === 1 ? [0] : []);
-    let nextFluidZ = 2;
-
     for (let idx = 0; idx < list.length; idx++) {
-      const s = list[idx];
-      s.laneX = laneStart + (idx % laneSpan);
+      list[idx].baseLaneOffset = idx % list[idx].laneSpan;
+    }
+  }
 
-      if (s.kind === 'molten') {
-        s.zLevel = 0;
-      } else if (s.kind === 'flat' || s.kind === 'loose') {
-        const z = solidZCursor <= 5 ? solidZCursor : 1 + ((solidZCursor - 1) % 5);
-        solidZCursor++;
-        s.zLevel = z;
-        usedSolidZs.add(z);
-      } else {
-        // Assign fluids elevated pipe rack levels above solid levels where possible
-        while (usedSolidZs.has(nextFluidZ) && nextFluidZ <= 5) nextFluidZ++;
-        s.zLevel = nextFluidZ > 6 ? 2 + ((idx) % 4) : nextFluidZ;
-        nextFluidZ++;
+  const allStreams = [...streamMap.values()];
+  const portToStreams = new Map<string, MaterialStream[]>();
+  for (const s of allStreams) {
+    for (const c of s.conns) {
+      for (const pk of [`${c.src.id}:${c.sp.name}`, `${c.dst.id}:${c.dp.name}`]) {
+        const arr = portToStreams.get(pk) ?? [];
+        if (!arr.includes(s)) arr.push(s);
+        portToStreams.set(pk, arr);
       }
     }
   }
 
-  // Helper: check if 2 ground tiles for a Conveyor Lift next to `port` are completely free
-  const canPlaceLiftAtPort = (port: WorldPort): boolean => {
-    const t1x = port.connX;
-    const t1y = port.connY;
-    const t2x = port.connX + sign(port.dirX);
-    const t2y = port.connY + sign(port.dirY);
-    return (
-      !occupiedGroundTiles.has(`${t1x},${t1y}`) &&
-      !occupiedGroundTiles.has(`${t2x},${t2y}`)
-    );
-  };
+  interface StreamComponent {
+    id: string;
+    productId: string;
+    kind: Exclude<LogisticsSummary['kind'], 'virtual'>;
+    streams: MaterialStream[];
+    box: TileBox;
+    corridors: Set<number>;
+  }
 
-  // Unify zLevel across solid (flat/loose) streams that share any (buildingId, portName) endpoint
-  // so no solid conveyor ever connects two Lifts or MiniZips of different heights.
+  const components: StreamComponent[] = [];
   {
-    const solidStreams = [...streamMap.values()].filter(
-      (s) => s.kind === 'flat' || s.kind === 'loose',
-    );
-    const portToStreams = new Map<string, MaterialStream[]>();
-    for (const s of solidStreams) {
-      for (const c of s.conns) {
-        for (const pk of [`${c.src.id}:${c.sp.name}`, `${c.dst.id}:${c.dp.name}`]) {
-          const arr = portToStreams.get(pk) ?? [];
-          if (!arr.includes(s)) arr.push(s);
-          portToStreams.set(pk, arr);
-        }
-      }
-    }
     const visited = new Set<MaterialStream>();
-    for (const seed of solidStreams) {
+    let compIdx = 0;
+    for (const seed of allStreams) {
       if (visited.has(seed)) continue;
-      const comp: MaterialStream[] = [];
+      const streams: MaterialStream[] = [];
       const queue: MaterialStream[] = [seed];
       visited.add(seed);
       while (queue.length > 0) {
         const cur = queue.shift()!;
-        comp.push(cur);
+        streams.push(cur);
         for (const c of cur.conns) {
           for (const pk of [`${c.src.id}:${c.sp.name}`, `${c.dst.id}:${c.dp.name}`]) {
             for (const nxt of portToStreams.get(pk) ?? []) {
-              if (!visited.has(nxt)) {
+              if (!visited.has(nxt) && nxt.productId === cur.productId) {
                 visited.add(nxt);
                 queue.push(nxt);
               }
@@ -1250,478 +1311,724 @@ export function buildCompactGridLayout(
         }
       }
 
-      // Pick the unified Z for this connected solid component and verify all ports can place Lifts if Z > 0
-      let unifiedZ = comp[0].zLevel;
-      if (unifiedZ > 0) {
-        for (const s of comp) {
-          for (const c of s.conns) {
-            if (!canPlaceLiftAtPort(c.sp) || !canPlaceLiftAtPort(c.dp)) {
-              unifiedZ = 0;
-              break;
-            }
+      let cMinX = Infinity;
+      let cMinY = Infinity;
+      let cMaxX = -Infinity;
+      let cMaxY = -Infinity;
+      const corridors = new Set<number>();
+      for (const s of streams) {
+        corridors.add(s.corridorIdx);
+        if (s.laneStart - 1 < cMinX) cMinX = s.laneStart - 1;
+        if (s.laneStart + s.laneSpan + 1 > cMaxX) {
+          cMaxX = s.laneStart + s.laneSpan + 1;
+        }
+        for (const c of s.conns) {
+          const sc = buildingColIdx.get(c.src.id) ?? 0;
+          const dc = buildingColIdx.get(c.dst.id) ?? 0;
+          const cLo = Math.min(sc, dc);
+          const cHi = Math.max(sc, dc);
+          for (let ci = cLo; ci < cHi; ci++) corridors.add(ci);
+          if (sc === dc) corridors.add(c.corridorIdx);
+
+          for (const pt of [c.sp, c.dp]) {
+            if (pt.connX - 2 < cMinX) cMinX = pt.connX - 2;
+            if (pt.connX + 2 > cMaxX) cMaxX = pt.connX + 2;
+            if (pt.connY - 2 < cMinY) cMinY = pt.connY - 2;
+            if (pt.connY + 2 > cMaxY) cMaxY = pt.connY + 2;
           }
-          if (unifiedZ === 0) break;
         }
       }
-      for (const s of comp) {
-        s.zLevel = unifiedZ;
-      }
+
+      components.push({
+        id: `comp-${compIdx++}`,
+        productId: seed.productId,
+        kind: seed.kind,
+        streams,
+        box: { minX: cMinX, minY: cMinY, maxX: cMaxX, maxY: cMaxY },
+        corridors,
+      });
     }
   }
 
-  // Cache attached Lifts per (buildingId, portName) so each port owns at most 1 Lift
+  // Process molten (Z=0) first, then solid conveyors (Z0..Z6), then elevated fluid pipes (Z2..Z12, Z1)
+  components.sort((a, b) => {
+    const rank = (k: StreamComponent['kind']) =>
+      k === 'molten' ? 0 : k === 'fluid' ? 2 : 1;
+    const dr = rank(a.kind) - rank(b.kind);
+    if (dr !== 0) return dr;
+    if (a.box.minX !== b.box.minX) return a.box.minX - b.box.minX;
+    return a.productId.localeCompare(b.productId);
+  });
+
+  // Global committed routing state across components (prevents ANY two products crossing at the same Z)
   const liftByPortKey = new Map<
     string,
     { lift: PlacedGridBuilding; elevatedPort: WorldPort; zLevel: number }
   >();
+  const voxelProduct = new Map<string, string>();
+  const reservedPortVoxels = new Map<string, string>();
+  const committedRegions: {
+    box: TileBox;
+    corridors: Set<number>;
+    z: number;
+    kind: StreamComponent['kind'];
+    productId: string;
+  }[] = [];
 
-  const attachOrGetLift = (
-    bld: PlacedGridBuilding,
-    port: WorldPort,
-    kind: 'flat' | 'loose',
-    zLevel: number,
-    isDown: boolean,
-    productId: string,
-  ): WorldPort => {
-    const pk = `${bld.id}:${port.name}`;
-    const existing = liftByPortKey.get(pk);
-    if (existing) return existing.elevatedPort;
-
-    const dx = sign(port.dirX);
-    const dy = sign(port.dirY);
-    const t1x = port.connX;
-    const t1y = port.connY;
-
-    let minX = t1x;
-    let minY = t1y;
-    let rotIndex: 0 | 1 | 2 | 3 = 0;
-    if (dx === 1 && dy === 0) {
-      minX = t1x;
-      minY = t1y;
-      rotIndex = 0;
-    } else if (dx === -1 && dy === 0) {
-      minX = t1x - 1;
-      minY = t1y;
-      rotIndex = 2;
-    } else if (dx === 0 && dy === 1) {
-      minX = t1x;
-      minY = t1y;
-      rotIndex = 1;
-    } else {
-      minX = t1x;
-      minY = t1y - 1;
-      rotIndex = 3;
-    }
-
-    const liftProto = getLiftProtoForKind(kind, zLevel, isDown);
-    const prod = PRODUCTS[productId];
-    const prodRu = getProductLabel(productId).ru ?? prod?.name ?? productId;
-    const liftId = `lift-${isDown ? 'dn' : 'up'}-${bld.id}-${port.name}-z${zLevel}`;
-
-    const lift = makePlacedBuilding(
-      {
-        id: liftId,
-        role: 'lift',
-        prototype: liftProto,
-        machineNameRu: isDown
-          ? `Спуск конвейера Z${zLevel}→0`
-          : `Подъёмник конвейера 0→Z${zLevel}`,
-        machineIcon: getTransportIconForKind(kind, 60),
-        storedProductId: productId,
-        storedProductNameRu: prodRu,
-        storedProductIcon: prod?.icon,
-      },
-      minX,
-      minY,
-      { minX, minY, rotIndex },
-      0,
-    );
-
-    buildings.push(lift);
-    for (let x = lift.minX; x < lift.minX + lift.width; x++) {
-      for (let y = lift.minY; y < lift.minY + lift.height; y++) {
-        occupiedGroundTiles.add(`${x},${y}`);
-        occupied3dTiles.add(`${x},${y},0`);
-        occupied3dTiles.add(`${x},${y},${zLevel}`);
+  // Pre-reserve every active port's connection tile (t1) and lift/leadout tile (t2)
+  // so no unrelated material routes over or blocks another port's Lift or vertical Pipe riser!
+  {
+    const seenT1 = new Set<string>();
+    for (const comp of components) {
+      const zCap = comp.kind === 'molten' ? 0 : comp.kind === 'fluid' ? 12 : 6;
+      for (const s of comp.streams) {
+        for (const c of s.conns) {
+          for (const pt of [c.sp, c.dp]) {
+            const pk = `${pt.connX},${pt.connY}`;
+            if (seenT1.has(pk)) continue;
+            seenT1.add(pk);
+            for (let z = 0; z <= zCap; z++) {
+              const vk = `${pt.connX},${pt.connY},${z}`;
+              if (!voxelProduct.has(vk)) {
+                voxelProduct.set(vk, comp.productId);
+                reservedPortVoxels.set(vk, comp.productId);
+              }
+            }
+          }
+        }
       }
     }
+    for (const comp of components) {
+      const zCap = comp.kind === 'molten' ? 0 : comp.kind === 'fluid' ? 1 : 6;
+      for (const s of comp.streams) {
+        for (const c of s.conns) {
+          for (const pt of [c.sp, c.dp]) {
+            const t2x = pt.connX + sign(pt.dirX);
+            const t2y = pt.connY + sign(pt.dirY);
+            if (occupiedGroundTiles.has(`${t2x},${t2y}`)) continue;
+            for (let z = 0; z <= zCap; z++) {
+              const vk = `${t2x},${t2y},${z}`;
+              if (!voxelProduct.has(vk)) {
+                voxelProduct.set(vk, comp.productId);
+                reservedPortVoxels.set(vk, comp.productId);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 
-    const elevatedPort = lift.ports.find((p) => p.name === 'X') ?? port;
-    liftByPortKey.set(pk, { lift, elevatedPort, zLevel });
-    return elevatedPort;
+  const boxesOverlap = (a: TileBox, b: TileBox): boolean =>
+    a.maxX >= b.minX && a.minX <= b.maxX && a.maxY >= b.minY && a.minY <= b.maxY;
+
+  const setsShareAny = (a: Set<number>, b: Set<number>): boolean => {
+    for (const v of a) {
+      if (b.has(v)) return true;
+    }
+    return false;
   };
 
   let routeCounter = 0;
   let junctionCounter = 0;
 
-  const pushRoute = (
-    kind: Exclude<LogisticsSummary['kind'], 'virtual'>,
+  interface SimulatedPlan {
+    newBuildings: PlacedGridBuilding[];
+    newRoutes: GridTransportRoute[];
+    newLifts: [string, { lift: PlacedGridBuilding; elevatedPort: WorldPort; zLevel: number }][];
+    newGroundKeys: string[];
+    new3dKeys: string[];
+    newVoxels: Vec3[];
+    conflicts: number;
+    totalLen: number;
+  }
+
+  const canPlaceLiftClean = (
+    port: WorldPort,
+    maxZ: number,
     productId: string,
-    ratePer60: number,
-    fromId: string,
-    fromPort: string,
-    toId: string,
-    toPort: string,
-    routed: { startDir: Vec3; endDir: Vec3; pivots: Vec3[]; zLevel: number },
-  ) => {
-    const prod = PRODUCTS[productId];
-    const prodRu = getProductLabel(productId).ru ?? prod?.name ?? productId;
-    const protoId = getTransportProtoForFlow(kind, ratePer60);
-    routes.push({
-      id: `route-${routeCounter++}`,
-      protoId,
-      iconUrl: getTransportIconForKind(kind, ratePer60),
-      kind,
-      zLevel: routed.zLevel,
-      productId,
-      productNameRu: prodRu,
-      productIcon: prod?.icon,
-      ratePer60,
-      fromBuildingId: fromId,
-      fromPortName: fromPort,
-      toBuildingId: toId,
-      toPortName: toPort,
-      startDir: routed.startDir,
-      endDir: routed.endDir,
-      pivots: routed.pivots,
-      color: kind === 'fluid' ? PIPE_MAIN_COLOR : BELT_MAIN_COLOR,
-      accentColor: kind === 'fluid' ? PIPE_ACCENT_COLOR : BELT_ACCENT_COLOR,
-    });
+    localGround: Set<string>,
+    localVoxels: Map<string, string>,
+  ): boolean => {
+    const t1x = port.connX;
+    const t1y = port.connY;
+    const t2x = port.connX + sign(port.dirX);
+    const t2y = port.connY + sign(port.dirY);
+    const k1 = `${t1x},${t1y}`;
+    const k2 = `${t2x},${t2y}`;
+    if (
+      occupiedGroundTiles.has(k1) ||
+      occupiedGroundTiles.has(k2) ||
+      localGround.has(k1) ||
+      localGround.has(k2)
+    ) {
+      return false;
+    }
+    if (
+      occupied3dTiles.has(`${t1x},${t1y},${maxZ}`) ||
+      occupied3dTiles.has(`${t2x},${t2y},${maxZ}`)
+    ) {
+      return false;
+    }
+    for (const zCheck of [0, maxZ]) {
+      for (const tx of [`${t1x},${t1y},${zCheck}`, `${t2x},${t2y},${zCheck}`]) {
+        const owner = localVoxels.get(tx) ?? voxelProduct.get(tx);
+        if (owner !== undefined && owner !== productId) return false;
+      }
+    }
+    return true;
   };
 
-  // Emit Lifts, MiniZip Manifolds (when a port splits/merges), and Routes per stream
-  for (const stream of streamMap.values()) {
-    let effZ = stream.zLevel;
+  const simulateComponentPlan = (
+    comp: StreamComponent,
+    effZ: number,
+    laneShift: number,
+  ): SimulatedPlan | null => {
+    const newBuildings: PlacedGridBuilding[] = [];
+    const newRoutes: GridTransportRoute[] = [];
+    const newLifts: [string, { lift: PlacedGridBuilding; elevatedPort: WorldPort; zLevel: number }][] = [];
+    const localGround = new Set<string>();
+    const local3d = new Set<string>();
+    const localLifts = new Map<string, { lift: PlacedGridBuilding; elevatedPort: WorldPort; zLevel: number }>();
+    const localVoxels = new Map<string, string>();
+    const newVoxels: Vec3[] = [];
+    let conflicts = 0;
+    let totalLen = 0;
+    let localRouteId = 0;
+    let localMzId = 0;
 
-    // For elevated solid belts (flat/loose with effZ > 0), verify all port ground tiles fit 2x1 Lifts;
-    // otherwise safely drop that stream to ground level z = 0
-    if ((stream.kind === 'flat' || stream.kind === 'loose') && effZ > 0) {
-      const uniquePortKeys = new Set<string>();
-      let allFit = true;
-      for (const c of stream.conns) {
-        const sk = `${c.src.id}:${c.sp.name}`;
-        const dk = `${c.dst.id}:${c.dp.name}`;
-        if (!uniquePortKeys.has(sk)) {
-          uniquePortKeys.add(sk);
-          if (!liftByPortKey.has(sk) && !canPlaceLiftAtPort(c.sp)) {
-            allFit = false;
-            break;
-          }
-        }
-        if (!uniquePortKeys.has(dk)) {
-          uniquePortKeys.add(dk);
-          if (!liftByPortKey.has(dk) && !canPlaceLiftAtPort(c.dp)) {
-            allFit = false;
-            break;
-          }
-        }
-      }
-      if (!allFit) {
-        effZ = 0;
-      }
-    }
+    // Fast proxy view passed into routePortToPort so foreign voxels across components AND earlier routes are checked
+    const combinedVoxels = {
+      get: (k: string) => localVoxels.get(k) ?? voxelProduct.get(k),
+    } as Map<string, string>;
 
-    // Build effective endpoint list (with Up-Lift / Down-Lift attached when effZ > 0 for solids)
-    interface EffConn {
-      srcId: string;
-      srcPortName: string;
-      spEff: WorldPort;
-      dstId: string;
-      dstPortName: string;
-      dpEff: WorldPort;
-      ratePer60: number;
-    }
-
-    const effConns: EffConn[] = [];
-    const srcEndpointCounts = new Map<string, number>();
-    const dstEndpointCounts = new Map<string, number>();
-
-    for (const c of stream.conns) {
-      let spEff = c.sp;
-      let dpEff = c.dp;
-      let srcId = c.src.id;
-      let srcPortName = c.sp.name;
-      let dstId = c.dst.id;
-      let dstPortName = c.dp.name;
-
-      if ((stream.kind === 'flat' || stream.kind === 'loose') && effZ > 0) {
-        spEff = attachOrGetLift(c.src, c.sp, stream.kind, effZ, false, stream.productId);
-        const upLift = liftByPortKey.get(`${c.src.id}:${c.sp.name}`)?.lift;
-        if (upLift) {
-          srcId = upLift.id;
-          srcPortName = spEff.name;
-        }
-        dpEff = attachOrGetLift(c.dst, c.dp, stream.kind, effZ, true, stream.productId);
-        const dnLift = liftByPortKey.get(`${c.dst.id}:${c.dp.name}`)?.lift;
-        if (dnLift) {
-          dstId = dnLift.id;
-          dstPortName = dpEff.name;
-        }
-      }
-
-      const sk = `${srcId}:${srcPortName}`;
-      const dk = `${dstId}:${dstPortName}`;
-      srcEndpointCounts.set(sk, (srcEndpointCounts.get(sk) ?? 0) + 1);
-      dstEndpointCounts.set(dk, (dstEndpointCounts.get(dk) ?? 0) + 1);
-
-      effConns.push({
-        srcId,
-        srcPortName,
-        spEff,
-        dstId,
-        dstPortName,
-        dpEff,
-        ratePer60: c.ratePer60,
+    const recordVoxels = (pivots: Vec3[]) => {
+      forEachSegmentVoxel(pivots, (x, y, z) => {
+        const k = `${x},${y},${z}`;
+        if (!localVoxels.has(k)) localVoxels.set(k, comp.productId);
+        newVoxels.push([x, y, z]);
       });
-    }
-
-    const hasSharedEndpoint =
-      [...srcEndpointCounts.values()].some((v) => v > 1) ||
-      [...dstEndpointCounts.values()].some((v) => v > 1);
-
-    if (!hasSharedEndpoint) {
-      // Clean 1-to-1 point-to-point connections
-      for (const ec of effConns) {
-        const routed = routePortToPort(
-          ec.spEff,
-          ec.dpEff,
-          stream.laneX,
-          detourAlleyYs,
-          effZ,
-          stream.kind,
-          blockedBoxes,
-        );
-        if (routed) {
-          pushRoute(
-            stream.kind,
-            stream.productId,
-            ec.ratePer60,
-            ec.srcId,
-            ec.srcPortName,
-            ec.dstId,
-            ec.dstPortName,
-            routed,
-          );
-        }
-      }
-      continue;
-    }
-
-    // 1-to-N / N-to-1 / M-to-N within same material:
-    // Construct a dedicated MiniZip_IoPortShape_* vertical manifold spine along (laneX, effZ)
-    const uniqueSrcMap = new Map<
-      string,
-      { id: string; portName: string; port: WorldPort; rate: number }
-    >();
-    const uniqueDstMap = new Map<
-      string,
-      { id: string; portName: string; port: WorldPort; rate: number }
-    >();
-    let totalStreamRate = 0;
-
-    for (const ec of effConns) {
-      totalStreamRate += ec.ratePer60;
-      const sk = `${ec.srcId}:${ec.srcPortName}`;
-      const existingSrc = uniqueSrcMap.get(sk);
-      if (existingSrc) existingSrc.rate += ec.ratePer60;
-      else {
-        uniqueSrcMap.set(sk, {
-          id: ec.srcId,
-          portName: ec.srcPortName,
-          port: ec.spEff,
-          rate: ec.ratePer60,
-        });
-      }
-
-      const dk = `${ec.dstId}:${ec.dstPortName}`;
-      const existingDst = uniqueDstMap.get(dk);
-      if (existingDst) existingDst.rate += ec.ratePer60;
-      else {
-        uniqueDstMap.set(dk, {
-          id: ec.dstId,
-          portName: ec.dstPortName,
-          port: ec.dpEff,
-          rate: ec.ratePer60,
-        });
-      }
-    }
-
-    interface TrunkSlot {
-      y: number;
-      westUsed: boolean; // Port C (x - 1)
-      eastUsed: boolean; // Port A (x + 1)
-      mz?: PlacedGridBuilding;
-    }
-
-    const trunkSlots: TrunkSlot[] = [];
-    const mzProto = getMiniZipProtoForKind(stream.kind);
-    const prod = PRODUCTS[stream.productId];
-    const prodRu = getProductLabel(stream.productId).ru ?? prod?.name ?? stream.productId;
-
-    const isSlotTileClear = (x: number, y: number): boolean => {
-      if (occupied3dTiles.has(`${x},${y},${effZ}`)) return false;
-      return !blockedBoxes.some(
-        (box) => x >= box.minX && x <= box.maxX && y >= box.minY && y <= box.maxY,
-      );
     };
 
-    const allocSlotForEndpoint = (targetY: number, useWest: boolean): TrunkSlot => {
-      // Reuse existing slot if its horizontal side is still free and close to targetY
-      const reusable = trunkSlots.find(
-        (s) =>
-          (useWest ? !s.westUsed : !s.eastUsed) && Math.abs(s.y - targetY) <= 1,
-      );
-      if (reusable) {
-        if (useWest) reusable.westUsed = true;
-        else reusable.eastUsed = true;
-        return reusable;
+    const getOrCreateLift = (
+      bld: PlacedGridBuilding,
+      port: WorldPort,
+      kind: 'flat' | 'loose',
+      isDown: boolean,
+    ): WorldPort | null => {
+      const pk = `${bld.id}:${port.name}`;
+      const globalEx = liftByPortKey.get(pk);
+      if (globalEx) return globalEx.zLevel === effZ ? globalEx.elevatedPort : null;
+      const localEx = localLifts.get(pk);
+      if (localEx) return localEx.elevatedPort;
+
+      if (!canPlaceLiftClean(port, effZ, comp.productId, localGround, localVoxels)) {
+        return null;
       }
 
-      // Otherwise allocate a fresh y separated by >= 3 tiles from any existing trunk MiniZip
-      let candY = targetY;
-      for (let step = 0; step < 80; step++) {
-        const offset = step === 0 ? 0 : (step % 2 === 1 ? 1 : -1) * Math.ceil(step / 2);
-        const tryY = targetY + offset * 3;
-        const spaced = trunkSlots.every((s) => Math.abs(s.y - tryY) >= 3);
-        if (spaced && isSlotTileClear(stream.laneX, tryY)) {
-          candY = tryY;
-          break;
-        }
+      const dx = sign(port.dirX);
+      const dy = sign(port.dirY);
+      const t1x = port.connX;
+      const t1y = port.connY;
+      let minX = t1x;
+      let minY = t1y;
+      let rotIndex: 0 | 1 | 2 | 3 = 0;
+      if (dx === 1 && dy === 0) {
+        minX = t1x;
+        minY = t1y;
+        rotIndex = 0;
+      } else if (dx === -1 && dy === 0) {
+        minX = t1x - 1;
+        minY = t1y;
+        rotIndex = 2;
+      } else if (dx === 0 && dy === 1) {
+        minX = t1x;
+        minY = t1y;
+        rotIndex = 1;
+      } else {
+        minX = t1x;
+        minY = t1y - 1;
+        rotIndex = 3;
       }
 
-      const slot: TrunkSlot = {
-        y: candY,
-        westUsed: useWest,
-        eastUsed: !useWest,
-      };
-      trunkSlots.push(slot);
-      return slot;
-    };
-
-    const srcAssignments = [...uniqueSrcMap.values()].map((srcItem) => {
-      const useWest = srcItem.port.connX <= stream.laneX;
-      const slot = allocSlotForEndpoint(srcItem.port.connY, useWest);
-      return { srcItem, useWest, slot };
-    });
-
-    const dstAssignments = [...uniqueDstMap.values()].map((dstItem) => {
-      const useWest = dstItem.port.connX < stream.laneX;
-      const slot = allocSlotForEndpoint(dstItem.port.connY, useWest);
-      return { dstItem, useWest, slot };
-    });
-
-    // Instantiate MiniZip entities on sorted trunk slots
-    trunkSlots.sort((a, b) => a.y - b.y);
-    for (const slot of trunkSlots) {
-      const mzId = `mz-${junctionCounter++}`;
-      const mz = makePlacedBuilding(
+      const prod = PRODUCTS[comp.productId];
+      const prodRu = getProductLabel(comp.productId).ru ?? prod?.name ?? comp.productId;
+      const liftId = `lift-${isDown ? 'dn' : 'up'}-${bld.id}-${port.name}-z${effZ}`;
+      const lift = makePlacedBuilding(
         {
-          id: mzId,
-          role: 'junction',
-          prototype: mzProto,
-          machineNameRu: `Разделитель Z${effZ} (${prodRu})`,
-          machineIcon: getTransportIconForKind(stream.kind, totalStreamRate),
-          storedProductId: stream.productId,
+          id: liftId,
+          role: 'lift',
+          prototype: getLiftProtoForKind(kind, effZ, isDown),
+          machineNameRu: isDown
+            ? `Спуск конвейера Z${effZ}→0`
+            : `Подъёмник конвейера 0→Z${effZ}`,
+          machineIcon: getTransportIconForKind(kind, 60),
+          storedProductId: comp.productId,
           storedProductNameRu: prodRu,
           storedProductIcon: prod?.icon,
         },
-        stream.laneX,
-        slot.y,
-        { minX: stream.laneX, minY: slot.y, rotIndex: 0 },
-        effZ,
+        minX,
+        minY,
+        { minX, minY, rotIndex },
+        0,
       );
-      slot.mz = mz;
-      buildings.push(mz);
-      occupied3dTiles.add(`${stream.laneX},${slot.y},${effZ}`);
-      if (effZ === 0) occupiedGroundTiles.add(`${stream.laneX},${slot.y}`);
-    }
 
-    // Connect consecutive MiniZips vertically along the trunk spine (Port B North -> Port D South)
-    for (let i = 0; i + 1 < trunkSlots.length; i++) {
-      const lo = trunkSlots[i].mz!;
-      const hi = trunkSlots[i + 1].mz!;
-      const loNorth = lo.ports.find((p) => p.name === 'B')!;
-      const hiSouth = hi.ports.find((p) => p.name === 'D')!;
-      const spine = routePortToPort(
-        loNorth,
-        hiSouth,
-        stream.laneX,
-        detourAlleyYs,
-        effZ,
-        stream.kind,
-        [],
-      );
-      if (spine) {
-        pushRoute(
-          stream.kind,
-          stream.productId,
-          totalStreamRate,
-          lo.id,
-          'B',
-          hi.id,
-          'D',
-          spine,
+      newBuildings.push(lift);
+      for (let x = lift.minX; x < lift.minX + lift.width; x++) {
+        for (let y = lift.minY; y < lift.minY + lift.height; y++) {
+          localGround.add(`${x},${y}`);
+          local3d.add(`${x},${y},0`);
+          local3d.add(`${x},${y},${effZ}`);
+          for (let z = 0; z <= effZ; z++) {
+            const vk = `${x},${y},${z}`;
+            localVoxels.set(vk, comp.productId);
+            newVoxels.push([x, y, z]);
+          }
+        }
+      }
+
+      const elevatedPort = lift.ports.find((p) => p.name === 'X') ?? port;
+      const entry = { lift, elevatedPort, zLevel: effZ };
+      localLifts.set(pk, entry);
+      newLifts.push([pk, entry]);
+      return elevatedPort;
+    };
+
+    const emitRoute = (
+      ratePer60: number,
+      fromId: string,
+      fromPort: string,
+      toId: string,
+      toPort: string,
+      routed: { startDir: Vec3; endDir: Vec3; pivots: Vec3[]; zLevel: number; voxelConflicts: number; boxCollisions: number },
+    ) => {
+      const prod = PRODUCTS[comp.productId];
+      const prodRu = getProductLabel(comp.productId).ru ?? prod?.name ?? comp.productId;
+      const protoId = getTransportProtoForFlow(comp.kind, ratePer60);
+      conflicts += routed.voxelConflicts + routed.boxCollisions * 10;
+      totalLen += manhattanLen(routed.pivots);
+      recordVoxels(routed.pivots);
+      newRoutes.push({
+        id: `sim-rt-${localRouteId++}`,
+        protoId,
+        iconUrl: getTransportIconForKind(comp.kind, ratePer60),
+        kind: comp.kind,
+        zLevel: routed.zLevel,
+        productId: comp.productId,
+        productNameRu: prodRu,
+        productIcon: prod?.icon,
+        ratePer60,
+        fromBuildingId: fromId,
+        fromPortName: fromPort,
+        toBuildingId: toId,
+        toPortName: toPort,
+        startDir: routed.startDir,
+        endDir: routed.endDir,
+        pivots: routed.pivots,
+        color: comp.kind === 'fluid' ? PIPE_MAIN_COLOR : BELT_MAIN_COLOR,
+        accentColor: comp.kind === 'fluid' ? PIPE_ACCENT_COLOR : BELT_ACCENT_COLOR,
+      });
+    };
+
+    for (const stream of comp.streams) {
+      let sMinY = Infinity;
+      let sMaxY = -Infinity;
+      for (const c of stream.conns) {
+        if (c.sp.connY < sMinY) sMinY = c.sp.connY;
+        if (c.sp.connY > sMaxY) sMaxY = c.sp.connY;
+        if (c.dp.connY < sMinY) sMinY = c.dp.connY;
+        if (c.dp.connY > sMaxY) sMaxY = c.dp.connY;
+      }
+
+      // Directly pick the corridor X lane with lowest foreign voxel occupancy at height effZ
+      let laneX =
+        stream.laneStart +
+        (((stream.baseLaneOffset + laneShift) % stream.laneSpan + stream.laneSpan) %
+          stream.laneSpan);
+      if (stream.laneSpan > 1 && Number.isFinite(sMinY)) {
+        let bestLaneHits = Infinity;
+        for (let k = 0; k < stream.laneSpan; k++) {
+          const offset = (stream.baseLaneOffset + laneShift + k) % stream.laneSpan;
+          const candX =
+            stream.laneStart + ((offset + stream.laneSpan) % stream.laneSpan);
+          let hits = 0;
+          for (let y = sMinY; y <= sMaxY; y++) {
+            const owner =
+              localVoxels.get(`${candX},${y},${effZ}`) ??
+              voxelProduct.get(`${candX},${y},${effZ}`);
+            if (owner !== undefined && owner !== comp.productId) hits++;
+          }
+          if (hits < bestLaneHits) {
+            bestLaneHits = hits;
+            laneX = candX;
+            if (hits === 0) break;
+          }
+        }
+      }
+
+      interface EffConn {
+        srcId: string;
+        srcPortName: string;
+        spEff: WorldPort;
+        dstId: string;
+        dstPortName: string;
+        dpEff: WorldPort;
+        ratePer60: number;
+      }
+
+      const effConns: EffConn[] = [];
+      const srcCounts = new Map<string, number>();
+      const dstCounts = new Map<string, number>();
+
+      for (const c of stream.conns) {
+        let spEff = c.sp;
+        let dpEff = c.dp;
+        let srcId = c.src.id;
+        let srcPortName = c.sp.name;
+        let dstId = c.dst.id;
+        let dstPortName = c.dp.name;
+
+        if ((comp.kind === 'flat' || comp.kind === 'loose') && effZ > 0) {
+          const upPort = getOrCreateLift(c.src, c.sp, comp.kind, false);
+          const dnPort = getOrCreateLift(c.dst, c.dp, comp.kind, true);
+          if (!upPort || !dnPort) return null;
+          spEff = upPort;
+          dpEff = dnPort;
+          srcId = (localLifts.get(`${c.src.id}:${c.sp.name}`) ?? liftByPortKey.get(`${c.src.id}:${c.sp.name}`))!.lift.id;
+          srcPortName = spEff.name;
+          dstId = (localLifts.get(`${c.dst.id}:${c.dp.name}`) ?? liftByPortKey.get(`${c.dst.id}:${c.dp.name}`))!.lift.id;
+          dstPortName = dpEff.name;
+        }
+
+        const sk = `${srcId}:${srcPortName}`;
+        const dk = `${dstId}:${dstPortName}`;
+        srcCounts.set(sk, (srcCounts.get(sk) ?? 0) + 1);
+        dstCounts.set(dk, (dstCounts.get(dk) ?? 0) + 1);
+        effConns.push({ srcId, srcPortName, spEff, dstId, dstPortName, dpEff, ratePer60: c.ratePer60 });
+      }
+
+      const hasShared =
+        [...srcCounts.values()].some((v) => v > 1) ||
+        [...dstCounts.values()].some((v) => v > 1);
+
+      if (!hasShared) {
+        for (const ec of effConns) {
+          const routed = routePortToPort(
+            ec.spEff,
+            ec.dpEff,
+            laneX,
+            detourAlleyYs,
+            effZ,
+            comp.kind,
+            blockedBoxes,
+            comp.productId,
+            combinedVoxels,
+          );
+          if (!routed) return null;
+          emitRoute(ec.ratePer60, ec.srcId, ec.srcPortName, ec.dstId, ec.dstPortName, routed);
+        }
+        continue;
+      }
+
+      // Build MiniZip vertical trunk spine for splits / merges
+      const uniqueSrcMap = new Map<string, { id: string; portName: string; port: WorldPort; rate: number }>();
+      const uniqueDstMap = new Map<string, { id: string; portName: string; port: WorldPort; rate: number }>();
+      let totalStreamRate = 0;
+
+      for (const ec of effConns) {
+        totalStreamRate += ec.ratePer60;
+        const sk = `${ec.srcId}:${ec.srcPortName}`;
+        const es = uniqueSrcMap.get(sk);
+        if (es) es.rate += ec.ratePer60;
+        else uniqueSrcMap.set(sk, { id: ec.srcId, portName: ec.srcPortName, port: ec.spEff, rate: ec.ratePer60 });
+
+        const dk = `${ec.dstId}:${ec.dstPortName}`;
+        const ed = uniqueDstMap.get(dk);
+        if (ed) ed.rate += ec.ratePer60;
+        else uniqueDstMap.set(dk, { id: ec.dstId, portName: ec.dstPortName, port: ec.dpEff, rate: ec.ratePer60 });
+      }
+
+      interface TrunkSlot {
+        y: number;
+        westUsed: boolean;
+        eastUsed: boolean;
+        mz?: PlacedGridBuilding;
+      }
+      const trunkSlots: TrunkSlot[] = [];
+      const mzProto = getMiniZipProtoForKind(comp.kind);
+      const prod = PRODUCTS[comp.productId];
+      const prodRu = getProductLabel(comp.productId).ru ?? prod?.name ?? comp.productId;
+
+      const isSlotClear = (x: number, y: number): boolean => {
+        const k = `${x},${y},${effZ}`;
+        if (occupied3dTiles.has(k) || local3d.has(k)) return false;
+        const owner = localVoxels.get(k) ?? voxelProduct.get(k);
+        if (owner !== undefined && owner !== comp.productId) return false;
+        return !blockedBoxes.some(
+          (box) => x >= box.minX && x <= box.maxX && y >= box.minY && y <= box.maxY,
         );
+      };
+
+      const allocSlot = (targetY: number, useWest: boolean): TrunkSlot => {
+        const reusable = trunkSlots.find(
+          (s) => (useWest ? !s.westUsed : !s.eastUsed) && Math.abs(s.y - targetY) <= 1,
+        );
+        if (reusable) {
+          if (useWest) reusable.westUsed = true;
+          else reusable.eastUsed = true;
+          return reusable;
+        }
+        let candY = targetY;
+        for (let step = 0; step < 80; step++) {
+          const offset = step === 0 ? 0 : (step % 2 === 1 ? 1 : -1) * Math.ceil(step / 2);
+          const tryY = targetY + offset * 3;
+          if (trunkSlots.every((s) => Math.abs(s.y - tryY) >= 3) && isSlotClear(laneX, tryY)) {
+            candY = tryY;
+            break;
+          }
+        }
+        const slot: TrunkSlot = { y: candY, westUsed: useWest, eastUsed: !useWest };
+        trunkSlots.push(slot);
+        return slot;
+      };
+
+      const srcAssignments = [...uniqueSrcMap.values()].map((srcItem) => {
+        const useWest = srcItem.port.connX <= laneX;
+        return { srcItem, useWest, slot: allocSlot(srcItem.port.connY, useWest) };
+      });
+      const dstAssignments = [...uniqueDstMap.values()].map((dstItem) => {
+        const useWest = dstItem.port.connX < laneX;
+        return { dstItem, useWest, slot: allocSlot(dstItem.port.connY, useWest) };
+      });
+
+      trunkSlots.sort((a, b) => a.y - b.y);
+      for (const slot of trunkSlots) {
+        const mzId = `sim-mz-${localMzId++}`;
+        const mz = makePlacedBuilding(
+          {
+            id: mzId,
+            role: 'junction',
+            prototype: mzProto,
+            machineNameRu: `Разделитель Z${effZ} (${prodRu})`,
+            machineIcon: getTransportIconForKind(comp.kind, totalStreamRate),
+            storedProductId: comp.productId,
+            storedProductNameRu: prodRu,
+            storedProductIcon: prod?.icon,
+          },
+          laneX,
+          slot.y,
+          { minX: laneX, minY: slot.y, rotIndex: 0 },
+          effZ,
+        );
+        slot.mz = mz;
+        newBuildings.push(mz);
+        local3d.add(`${laneX},${slot.y},${effZ}`);
+        if (effZ === 0) localGround.add(`${laneX},${slot.y}`);
+        const vk = `${laneX},${slot.y},${effZ}`;
+        const prevOwner = localVoxels.get(vk) ?? voxelProduct.get(vk);
+        if (prevOwner !== undefined && prevOwner !== comp.productId) conflicts += 5;
+        localVoxels.set(vk, comp.productId);
+        newVoxels.push([laneX, slot.y, effZ]);
+      }
+
+      for (let i = 0; i + 1 < trunkSlots.length; i++) {
+        const lo = trunkSlots[i].mz!;
+        const hi = trunkSlots[i + 1].mz!;
+        const spine = routePortToPort(
+          lo.ports.find((p) => p.name === 'B')!,
+          hi.ports.find((p) => p.name === 'D')!,
+          laneX,
+          detourAlleyYs,
+          effZ,
+          comp.kind,
+          [],
+          comp.productId,
+          combinedVoxels,
+        );
+        if (!spine) return null;
+        emitRoute(totalStreamRate, lo.id, 'B', hi.id, 'D', spine);
+      }
+
+      for (const { srcItem, useWest, slot } of srcAssignments) {
+        const mz = slot.mz!;
+        const portName = useWest ? 'C' : 'A';
+        const mzPort = mz.ports.find((p) => p.name === portName)!;
+        const midX = Math.round((srcItem.port.connX + mzPort.connX) / 2);
+        const routed = routePortToPort(
+          srcItem.port,
+          mzPort,
+          midX,
+          detourAlleyYs,
+          effZ,
+          comp.kind,
+          blockedBoxes,
+          comp.productId,
+          combinedVoxels,
+        );
+        if (!routed) return null;
+        emitRoute(srcItem.rate, srcItem.id, srcItem.portName, mz.id, portName, routed);
+      }
+
+      for (const { dstItem, useWest, slot } of dstAssignments) {
+        const mz = slot.mz!;
+        const portName = useWest ? 'C' : 'A';
+        const mzPort = mz.ports.find((p) => p.name === portName)!;
+        const midX = Math.round((mzPort.connX + dstItem.port.connX) / 2);
+        const routed = routePortToPort(
+          mzPort,
+          dstItem.port,
+          midX,
+          detourAlleyYs,
+          effZ,
+          comp.kind,
+          blockedBoxes,
+          comp.productId,
+          combinedVoxels,
+        );
+        if (!routed) return null;
+        emitRoute(dstItem.rate, mz.id, portName, dstItem.id, dstItem.portName, routed);
       }
     }
 
-    // Connect each unique source -> its assigned MiniZip side port
-    for (const { srcItem, useWest, slot } of srcAssignments) {
-      const mz = slot.mz!;
-      const portName = useWest ? 'C' : 'A';
-      const mzPort = mz.ports.find((p) => p.name === portName)!;
-      const midX = Math.round((srcItem.port.connX + mzPort.connX) / 2);
-      const routed = routePortToPort(
-        srcItem.port,
-        mzPort,
-        midX,
-        detourAlleyYs,
-        effZ,
-        stream.kind,
-        blockedBoxes,
-      );
-      if (routed) {
-        pushRoute(
-          stream.kind,
-          stream.productId,
-          srcItem.rate,
-          srcItem.id,
-          srcItem.portName,
-          mz.id,
-          portName,
-          routed,
-        );
+    return {
+      newBuildings,
+      newRoutes,
+      newLifts,
+      newGroundKeys: [...localGround],
+      new3dKeys: [...local3d],
+      newVoxels,
+      conflicts,
+      totalLen,
+    };
+  };
+
+  for (const comp of components) {
+    const baseZs =
+      comp.kind === 'molten'
+        ? [0]
+        : comp.kind === 'fluid'
+          ? [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1]
+          : [0, 1, 2, 3, 4, 5, 6];
+
+    const regionOverlapCount = (z: number): number => {
+      let score = 0;
+      for (const prev of committedRegions) {
+        if (prev.z !== z || prev.productId === comp.productId) continue;
+        const boxHit = boxesOverlap(comp.box, prev.box);
+        const corrHit = setsShareAny(comp.corridors, prev.corridors);
+        if (boxHit || corrHit) {
+          score += (boxHit ? 10 : 1) + (prev.kind === 'molten' && z === 0 ? 20 : 0);
+        }
+      }
+      return score;
+    };
+
+    const sortedZs = [...baseZs].sort((a, b) => {
+      const oa = regionOverlapCount(a);
+      const ob = regionOverlapCount(b);
+      if (oa !== ob) return oa - ob;
+      return baseZs.indexOf(a) - baseZs.indexOf(b);
+    });
+
+    let bestPlan: SimulatedPlan | null = null;
+    let bestZ = sortedZs[0];
+    let bestScore = Infinity;
+
+    const emptySet = new Set<string>();
+    const emptyMap = new Map<string, string>();
+    let bestOverlapPen = 0;
+
+    for (const zCand of sortedZs) {
+      if ((comp.kind === 'flat' || comp.kind === 'loose') && zCand > 0) {
+        let allLiftsClear = true;
+        for (const s of comp.streams) {
+          for (const c of s.conns) {
+            if (
+              !canPlaceLiftClean(c.sp, zCand, comp.productId, emptySet, emptyMap) ||
+              !canPlaceLiftClean(c.dp, zCand, comp.productId, emptySet, emptyMap)
+            ) {
+              allLiftsClear = false;
+              break;
+            }
+          }
+          if (!allLiftsClear) break;
+        }
+        if (!allLiftsClear) continue;
+      }
+
+      const overlapPen = regionOverlapCount(zCand);
+      const plan = simulateComponentPlan(comp, zCand, 0);
+      if (!plan) continue;
+
+      const score =
+        plan.conflicts * 100_000 + overlapPen * 10_000 + plan.totalLen;
+      if (score < bestScore) {
+        bestScore = score;
+        bestPlan = plan;
+        bestZ = zCand;
+        bestOverlapPen = overlapPen;
+      }
+      if (plan.conflicts === 0) break;
+    }
+
+    if (bestPlan && bestPlan.conflicts > 0) {
+      for (const shift of [1, -1]) {
+        const altPlan = simulateComponentPlan(comp, bestZ, shift);
+        if (!altPlan) continue;
+        const altScore =
+          altPlan.conflicts * 100_000 +
+          bestOverlapPen * 10_000 +
+          altPlan.totalLen +
+          5;
+        if (altScore < bestScore) {
+          bestScore = altScore;
+          bestPlan = altPlan;
+        }
+        if (altPlan.conflicts === 0) break;
       }
     }
 
-    // Connect each MiniZip side port -> its unique destination
-    for (const { dstItem, useWest, slot } of dstAssignments) {
-      const mz = slot.mz!;
-      const portName = useWest ? 'C' : 'A';
-      const mzPort = mz.ports.find((p) => p.name === portName)!;
-      const midX = Math.round((mzPort.connX + dstItem.port.connX) / 2);
-      const routed = routePortToPort(
-        mzPort,
-        dstItem.port,
-        midX,
-        detourAlleyYs,
-        effZ,
-        stream.kind,
-        blockedBoxes,
-      );
-      if (routed) {
-        pushRoute(
-          stream.kind,
-          stream.productId,
-          dstItem.rate,
-          mz.id,
-          portName,
-          dstItem.id,
-          dstItem.portName,
-          routed,
-        );
+    if (!bestPlan) continue;
+
+    // Assign final stable building & route IDs and commit to global occupancy maps
+    const idRemap = new Map<string, string>();
+    for (const b of bestPlan.newBuildings) {
+      if (b.id.startsWith('sim-mz-')) {
+        const finalId = `mz-${junctionCounter++}`;
+        idRemap.set(b.id, finalId);
+        b.id = finalId;
+      }
+      buildings.push(b);
+    }
+    for (const [pk, entry] of bestPlan.newLifts) {
+      liftByPortKey.set(pk, entry);
+    }
+    for (const rt of bestPlan.newRoutes) {
+      rt.id = `route-${routeCounter++}`;
+      if (rt.fromBuildingId && idRemap.has(rt.fromBuildingId)) {
+        rt.fromBuildingId = idRemap.get(rt.fromBuildingId);
+      }
+      if (rt.toBuildingId && idRemap.has(rt.toBuildingId)) {
+        rt.toBuildingId = idRemap.get(rt.toBuildingId);
+      }
+      routes.push(rt);
+    }
+    for (const gk of bestPlan.newGroundKeys) occupiedGroundTiles.add(gk);
+    for (const k3 of bestPlan.new3dKeys) occupied3dTiles.add(k3);
+    for (const [vx, vy, vz] of bestPlan.newVoxels) {
+      const vk = `${vx},${vy},${vz}`;
+      const reservedOwner = reservedPortVoxels.get(vk);
+      if (!reservedOwner || reservedOwner === comp.productId) {
+        voxelProduct.set(vk, comp.productId);
       }
     }
+    committedRegions.push({
+      box: comp.box,
+      corridors: comp.corridors,
+      z: bestZ,
+      kind: comp.kind,
+      productId: comp.productId,
+    });
   }
 
   // Compute grid bounds including all buildings, lifts, junctions, and transport pivots

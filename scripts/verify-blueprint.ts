@@ -170,6 +170,48 @@ for (const preset of STARTER_PRESETS) {
     }
   }
 
+  // 5. Assert coal and copper_ore never share a Z level or cross, and count any same-Z crossings
+  const coalZs = new Set(generated.gridPlan.routes.filter((r) => r.productId === 'coal').map((r) => r.zLevel));
+  const cuOreZs = new Set(generated.gridPlan.routes.filter((r) => r.productId === 'copper_ore').map((r) => r.zLevel));
+  if (coalZs.size > 0 && cuOreZs.size > 0) {
+    const shared = [...coalZs].filter((z) => cuOreZs.has(z));
+    assert.equal(shared.length, 0, `coal and copper_ore share Z level(s) [${shared.join(',')}] in ${preset.name}`);
+  }
+
+  let sameZCrossings = 0;
+  const rts = generated.gridPlan.routes;
+  for (let i = 0; i < rts.length; i++) {
+    for (let j = i + 1; j < rts.length; j++) {
+      const a = rts[i];
+      const b = rts[j];
+      if (!a.productId || a.productId === b.productId || a.zLevel !== b.zLevel) continue;
+      for (let s1 = 1; s1 < a.pivots.length; s1++) {
+        const p1 = a.pivots[s1 - 1];
+        const p2 = a.pivots[s1];
+        if (p1[2] !== a.zLevel || p2[2] !== a.zLevel) continue;
+        const ax1 = Math.min(p1[0], p2[0]);
+        const ax2 = Math.max(p1[0], p2[0]);
+        const ay1 = Math.min(p1[1], p2[1]);
+        const ay2 = Math.max(p1[1], p2[1]);
+        for (let s2 = 1; s2 < b.pivots.length; s2++) {
+          const q1 = b.pivots[s2 - 1];
+          const q2 = b.pivots[s2];
+          if (q1[2] !== b.zLevel || q2[2] !== b.zLevel) continue;
+          const bx1 = Math.min(q1[0], q2[0]);
+          const bx2 = Math.max(q1[0], q2[0]);
+          const by1 = Math.min(q1[1], q2[1]);
+          const by2 = Math.max(q1[1], q2[1]);
+          if (ax2 >= bx1 && ax1 <= bx2 && ay2 >= by1 && ay1 <= by2) {
+            sameZCrossings++;
+          }
+        }
+      }
+    }
+  }
+  if (preset.id === 'preset-stage1-starter' || preset.id === 'preset-petrochem') {
+    assert.equal(sameZCrossings, 0, `Expected 0 same-Z crossings in ${preset.name}, got ${sameZCrossings}`);
+  }
+
   const liftCount = generated.gridPlan.buildings.filter((b) => b.role === 'lift').length;
   const miniZipCount = generated.gridPlan.buildings.filter((b) => b.role === 'junction').length;
   const elevatedRoutes = generated.gridPlan.routes.filter((rt) => rt.zLevel > 0).length;
@@ -181,7 +223,7 @@ for (const preset of STARTER_PRESETS) {
   }
   assert.ok(elevatedRoutes > 0, `Expected multi-level routes (zLevel > 0) in ${preset.name}`);
   console.log(
-    `  ✓ Round-trip decoded: ${roundTrip.totalEntities} entities (in=${generated.gridPlan.inputStoragesCount}, out=${generated.gridPlan.outputStoragesCount}, lifts=${liftCount}, miniZip=${miniZipCount}, dumpTanks=${dumpTanks}, elevated=${elevatedRoutes}/${generated.gridPlan.routes.length}, trailer=${trailerHex})`,
+    `  ✓ Round-trip decoded: ${roundTrip.totalEntities} entities (in=${generated.gridPlan.inputStoragesCount}, out=${generated.gridPlan.outputStoragesCount}, lifts=${liftCount}, miniZip=${miniZipCount}, dumpTanks=${dumpTanks}, elevated=${elevatedRoutes}/${generated.gridPlan.routes.length}, sameZCross=${sameZCrossings}, trailer=${trailerHex})`,
   );
 
   if (outDir) {
