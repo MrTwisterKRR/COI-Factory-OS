@@ -400,9 +400,13 @@ export function encodePlanToGameBlueprint(
     });
   }
 
-  // Library v4 trailer: 0 surfaces, 0 decals, 0 overlapX, 0 overlapY
+  // Library v4 trailer matching Blueprint.DeserializeForBlueprints:
+  // 1) surfaces count = 0, 2) decals count = 0,
+  // 3) legacy custom protos count = 0 (libraryVersion 2..5),
+  // 4) overlapDeltaX = 0, 5) overlapDeltaY = 0 (libraryVersion >= 4)
   w.writeUInt(0); // surfaces count
   w.writeUInt(0); // decals count
+  w.writeUInt(0); // legacy custom protos count
   w.writeInt(0); // overlapDeltaX
   w.writeInt(0); // overlapDeltaY
 
@@ -468,6 +472,10 @@ export function decodeGameBlueprint(rawCode: string): DecodedGameBlueprint {
   const r = new BlobReader(rawBytes);
 
   const libraryVersion = r.readUInt();
+  // Blueprints exported with libraryVersion >= 7 store loadedSaveVersion before Blueprint header
+  if (libraryVersion >= 7) {
+    r.readUInt();
+  }
   const gameVersion = r.readString() ?? '';
   const saveVersion = r.readUInt();
   const name = r.readString() ?? 'Без названия';

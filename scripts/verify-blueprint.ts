@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { gunzipSync } from 'node:zlib';
 import { STARTER_PRESETS } from '../src/data/presets';
 import { solveProductionChain } from '../src/engine/solver';
 import { analyzeByproductsAndStorage } from '../src/engine/byproductAdvisor';
@@ -32,7 +33,58 @@ console.log('Imported Plan targets:', importedPlan.targets.map((t) => `${t.produ
 console.log('Imported Solved Steps:', importedSolved.steps.length, '| Workers:', importedSolved.summary.totalWorkers);
 assert.ok(importedSolved.steps.length > 0);
 
+function readGeneratedTrailerHex(code: string): string {
+  const b64 = code.slice(code.indexOf(':') + 1);
+  const bytes = gunzipSync(Buffer.from(b64, 'base64'));
+  let pos = 0;
+  const strTable: (string | null)[] = [null];
+  const rb = () => bytes[pos++];
+  const ru = () => {
+    let r = 0, s = 0;
+    for (;;) {
+      const b = rb();
+      r |= (b & 0x7f) << s;
+      if ((b & 0x80) === 0) break;
+      s += 7;
+    }
+    return r >>> 0;
+  };
+  const ri = () => {
+    const n = ru();
+    return (n >>> 1) ^ -(n & 1);
+  };
+  const rs = () => {
+    const ref = ru();
+    if (ref === strTable.length) {
+      const l = ru();
+      const s = Buffer.from(bytes.subarray(pos, pos + l)).toString('utf8');
+      pos += l;
+      strTable.push(s);
+      return s;
+    }
+    return strTable[ref];
+  };
+
+  const libVer = ru();
+  if (libVer >= 7) ru();
+  rs(); // gameVersion
+  ru(); // saveVersion
+  rs(); // name
+  rs(); // description
+  const count = ru();
+  for (let i = 0; i < count; i++) {
+    let n = ru(); for (let j = 0; j < n; j++) { rs(); ri(); }
+    n = ru(); for (let j = 0; j < n; j++) { rs(); rb(); }
+    n = ru(); for (let j = 0; j < n; j++) { rs(); rs(); }
+    n = ru(); for (let j = 0; j < n; j++) { rs(); const l = ru(); for (let m = 0; m < l; m++) rs(); }
+    n = ru(); for (let j = 0; j < n; j++) { rs(); const l = ru(); pos += l; }
+  }
+  return Buffer.from(bytes.subarray(pos)).toString('hex');
+}
+
 console.log('\n=== 2. Encoding & Round-trip verifying all Starter Presets ===');
+const outDir = process.env.VERIFY_BP_OUT_DIR;
+if (outDir) fs.mkdirSync(outDir, { recursive: true });
 for (const preset of STARTER_PRESETS) {
   const solved = solveProductionChain(preset);
   const generated = encodePlanToGameBlueprint(solved, preset.name, {
@@ -45,10 +97,20 @@ for (const preset of STARTER_PRESETS) {
   assert.equal(generated.unmappedRecipes.length, 0, `Unmapped recipes in ${preset.name}: ${generated.unmappedRecipes.join(', ')}`);
   assert.match(generated.code, /^B\d+:H4sI/);
 
+  const trailerHex = readGeneratedTrailerHex(generated.code);
+  assert.equal(trailerHex, '0000000000', `Expected 5-byte v4 trailer 0000000000 for ${preset.name}, got ${trailerHex}`);
+
   const roundTrip = decodeGameBlueprint(generated.code);
   assert.equal(roundTrip.name, preset.name);
   assert.equal(roundTrip.totalEntities, generated.entityCount);
-  console.log(`  ✓ Round-trip decoded: ${roundTrip.totalEntities} entities across ${roundTrip.machineGroups.length} building groups`);
+  console.log(`  ✓ Round-trip decoded: ${roundTrip.totalEntities} entities across ${roundTrip.machineGroups.length} building groups (trailer=${trailerHex})`);
+
+  if (outDir) {
+    fs.writeFileSync(`${outDir}/${preset.id}.txt`, generated.code, 'utf8');
+  }
+  if (preset.name === 'Стройдетали I–III') {
+    console.log(`  [Стройдетали I–III CODE]: ${generated.code}`);
+  }
 }
 
 console.log('\n=== 3. Verifying Byproduct & Storage Advisor (Нефтехим и Дизель) ===');
