@@ -1,20 +1,34 @@
 import { gzip, ungzip } from 'pako';
 import {
+  GAME_ID_TO_PRODUCT_ID,
   GAME_ID_TO_RECIPE_ID,
   MACHINES,
   MACHINE_BY_GAME_ID,
+  PRODUCTS,
   RECIPES,
-  RECIPE_GAME_IDS,
   getMachineLabel,
   getProductLabel,
   getRecipeLabel,
+  getTransportIconForKind,
 } from '../data';
+import {
+  getBuildingOccupiedBox,
+  getBuildingWorldPorts,
+  normalizeRotIndex,
+} from '../data/buildingLayouts';
 import type {
   FactoryPlanConfig,
+  LogisticsSummary,
   ProductionTarget,
   SolveResult,
 } from '../types/coi';
-import { analyzeByproductsAndStorage } from './byproductAdvisor';
+import {
+  type CompactGridPlan,
+  type CustomTilePlacement,
+  type GridTransportRoute,
+  type PlacedGridBuilding,
+  buildCompactGridLayout,
+} from './blueprintGridPlanner';
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder('utf-8');
@@ -162,21 +176,143 @@ function encodeTransform(
   return tw.toUint8Array();
 }
 
-function writeEntityConfig(
+function decodeTransform(bytes: Uint8Array): {
+  x: number;
+  y: number;
+  z: number;
+  rotIndex: 0 | 1 | 2 | 3;
+  reflected: boolean;
+} {
+  const r = new BlobReader(bytes);
+  const x = r.readInt();
+  const y = r.readInt();
+  const z = r.readInt();
+  const rotIndex = normalizeRotIndex(r.readInt());
+  const reflected = r.readBool();
+  return { x, y, z, rotIndex, reflected };
+}
+
+function encodeTrajectory(
+  startDir: [number, number, number],
+  endDir: [number, number, number],
+  pivots: [number, number, number][],
+): Uint8Array {
+  const tw = new BlobWriter();
+  tw.writeInt(startDir[0]);
+  tw.writeInt(startDir[1]);
+  tw.writeInt(startDir[2]);
+  tw.writeInt(endDir[0]);
+  tw.writeInt(endDir[1]);
+  tw.writeInt(endDir[2]);
+  tw.writeUInt(pivots.length);
+  for (const [x, y, z] of pivots) {
+    tw.writeInt(x);
+    tw.writeInt(y);
+    tw.writeInt(z);
+  }
+  return tw.toUint8Array();
+}
+
+function decodeTrajectory(bytes: Uint8Array): {
+  startDir: [number, number, number];
+  endDir: [number, number, number];
+  pivots: [number, number, number][];
+} {
+  const r = new BlobReader(bytes);
+  const startDir: [number, number, number] = [r.readInt(), r.readInt(), r.readInt()];
+  const endDir: [number, number, number] = [r.readInt(), r.readInt(), r.readInt()];
+  const len = r.readUInt();
+  const pivots: [number, number, number][] = [];
+  for (let i = 0; i < len; i++) {
+    pivots.push([r.readInt(), r.readInt(), r.readInt()]);
+  }
+  return { startDir, endDir, pivots };
+}
+
+function writeBuildingEntityConfig(
   w: BlobWriter,
-  opts: {
-    originalId: number;
-    prototype: string;
-    recipes?: string[];
-    x: number;
-    y: number;
-    customTitle?: string;
-  },
+  originalId: number,
+  b: PlacedGridBuilding,
 ): void {
-  // 1. integers dict: 4 keys (OriginalEntityId, LogisticsInputMode, LogisticsOutputMode, GeneralPriority)
+  const isStorage =
+    b.role === 'input_storage' ||
+    b.role === 'output_storage' ||
+    b.role === 'buffer_storage';
+
+  if (b.role === 'junction') {
+    // Minimal 1x1 MiniZip junction entity (only OriginalEntityId + Prototype + Transform)
+    w.writeUInt(1);
+    w.writeString('OriginalEntityId');
+    w.writeInt(originalId);
+    w.writeUInt(0); // bools
+    w.writeUInt(1); // strings
+    w.writeString('Prototype');
+    w.writeString(b.prototype);
+    w.writeUInt(0); // stringArrays
+    w.writeUInt(1); // byteArrays
+    w.writeString('Transform');
+    w.writeByteArray(encodeTransform(b.tx, b.ty, b.tz, b.rotIndex, b.reflected));
+    return;
+  }
+
+  if (isStorage) {
+    const isInput = b.role === 'input_storage';
+    // 1. integers dict: OriginalEntityId + Storage logistics configuration
+    w.writeUInt(7);
+    w.writeString('OriginalEntityId');
+    w.writeInt(originalId);
+    w.writeString('StorageImportUntilPercent');
+    w.writeInt(isInput ? 100000 : 0);
+    w.writeString('StorageExportFromPercent');
+    w.writeInt(isInput ? 0 : 100000);
+    w.writeString('StorageTransportFromPercent');
+    w.writeInt(0);
+    w.writeString('StorageTransportUntilPercent');
+    w.writeInt(100000);
+    w.writeString('StorageImportPriority');
+    w.writeInt(8);
+    w.writeString('StorageExportPriority');
+    w.writeInt(8);
+
+    // 2. booleans dict
+    w.writeUInt(3);
+    w.writeString('IsLogisticsInputDisabled');
+    w.writeBool(!isInput);
+    w.writeString('IsLogisticsOutputDisabled');
+    w.writeBool(isInput);
+    w.writeString('AllowNonAssignedOutput');
+    w.writeBool(false);
+
+    // 3. strings dict
+    const strs: [string, string][] = [['Prototype', b.prototype]];
+    if (b.storedProductGameId) {
+      strs.push(['StorageStoredProduct', b.storedProductGameId]);
+    }
+    if (b.customTitle) {
+      strs.push(['CustomTitle', b.customTitle]);
+    }
+    w.writeUInt(strs.length);
+    for (const [k, v] of strs) {
+      w.writeString(k);
+      w.writeString(v);
+    }
+
+    // 4. stringArrays dict
+    w.writeUInt(1);
+    w.writeString('AllowedTruckGroups');
+    w.writeUInt(0);
+
+    // 5. byteArrays dict
+    w.writeUInt(1);
+    w.writeString('Transform');
+    w.writeByteArray(encodeTransform(b.tx, b.ty, b.tz, b.rotIndex, b.reflected));
+    return;
+  }
+
+  // Production / disposal entity
   w.writeUInt(4);
   w.writeString('OriginalEntityId');
-  w.writeInt(opts.originalId);
+  w.writeInt(originalId);
   w.writeString('LogisticsInputMode');
   w.writeInt(2);
   w.writeString('LogisticsOutputMode');
@@ -184,38 +320,62 @@ function writeEntityConfig(
   w.writeString('GeneralPriority');
   w.writeInt(9);
 
-  // 2. booleans dict
-  w.writeUInt(0);
+  w.writeUInt(0); // booleans
 
-  // 3. strings dict
-  if (opts.customTitle) {
+  if (b.customTitle) {
     w.writeUInt(2);
     w.writeString('Prototype');
-    w.writeString(opts.prototype);
+    w.writeString(b.prototype);
     w.writeString('CustomTitle');
-    w.writeString(opts.customTitle);
+    w.writeString(b.customTitle);
   } else {
     w.writeUInt(1);
     w.writeString('Prototype');
-    w.writeString(opts.prototype);
+    w.writeString(b.prototype);
   }
 
-  // 4. stringArrays dict
-  if (opts.recipes && opts.recipes.length > 0) {
+  if (b.gameRecipeId) {
     w.writeUInt(1);
     w.writeString('Recipes');
-    w.writeUInt(opts.recipes.length);
-    for (const r of opts.recipes) {
-      w.writeString(r);
-    }
+    w.writeUInt(1);
+    w.writeString(b.gameRecipeId);
   } else {
     w.writeUInt(0);
   }
 
-  // 5. byteArrays dict
   w.writeUInt(1);
   w.writeString('Transform');
-  w.writeByteArray(encodeTransform(opts.x, opts.y, 0, 0, false));
+  w.writeByteArray(encodeTransform(b.tx, b.ty, b.tz, b.rotIndex, b.reflected));
+}
+
+function writeTransportEntityConfig(
+  w: BlobWriter,
+  route: GridTransportRoute,
+): void {
+  // 1. integers dict: TransportColor + TransportAccentColor
+  w.writeUInt(2);
+  w.writeString('TransportColor');
+  w.writeInt(route.color);
+  w.writeString('TransportAccentColor');
+  w.writeInt(route.accentColor);
+
+  // 2. booleans dict
+  w.writeUInt(0);
+
+  // 3. strings dict
+  w.writeUInt(1);
+  w.writeString('Prototype');
+  w.writeString(route.protoId);
+
+  // 4. stringArrays dict
+  w.writeUInt(0);
+
+  // 5. byteArrays dict: Trajectory
+  w.writeUInt(1);
+  w.writeString('Trajectory');
+  w.writeByteArray(
+    encodeTrajectory(route.startDir, route.endDir, route.pivots),
+  );
 }
 
 function uint8ToBase64(bytes: Uint8Array): string {
@@ -258,125 +418,46 @@ export interface GeneratedGameBlueprint {
   entityCount: number;
   entries: BlueprintExportEntry[];
   unmappedRecipes: string[];
+  gridPlan: CompactGridPlan;
 }
 
-export function encodePlanToGameBlueprint(
-  solveResult: SolveResult,
+export function encodeGridPlanToGameBlueprint(
+  gridPlan: CompactGridPlan,
   planName: string,
-  options: BlueprintExportOptions,
 ): GeneratedGameBlueprint {
-  const entries: BlueprintExportEntry[] = [];
-  const unmappedRecipes: string[] = [];
-
-  interface PlannedEntity {
-    prototype: string;
-    recipes?: string[];
-    x: number;
-    y: number;
-  }
-
-  const planned: PlannedEntity[] = [];
-
-  // Place production buildings grouped cleanly in columns by stage depth (upstream on left, targets on right)
-  const depths = [...new Set(solveResult.steps.map((s) => s.depth))].sort(
-    (a, b) => b - a,
-  );
-  const depthToCol = new Map<number, number>(depths.map((d, idx) => [d, idx]));
-  const colRowCounter = new Map<number, number>();
-
-  for (const step of solveResult.steps) {
-    if (step.kind !== 'recipe') continue;
-    const machine = MACHINES[step.machineId];
-    if (!machine?.game_id || machine.isMine) continue;
-    const count = Math.max(1, step.ceilMachines);
-    const col = depthToCol.get(step.depth) ?? 0;
-    const gameRecipeId = step.recipeId
-      ? RECIPE_GAME_IDS[step.recipeId]
-      : undefined;
-
-    if (step.recipeId && !gameRecipeId) {
-      unmappedRecipes.push(step.recipeId);
-    }
-
-    entries.push({
-      machineId: machine.id,
-      machineGameId: machine.game_id,
-      machineNameRu: getMachineLabel(machine.id).ru,
-      recipeId: step.recipeId,
-      gameRecipeId,
-      recipeNameRu: step.recipeName,
-      count,
-      kind: 'production',
-    });
-
-    for (let i = 0; i < count; i++) {
-      const row = colRowCounter.get(col) ?? 0;
-      colRowCounter.set(col, row + 1);
-      planned.push({
-        prototype: machine.game_id,
-        recipes: gameRecipeId ? [gameRecipeId] : undefined,
-        x: col * 18,
-        y: row * 12,
+  const entriesMap = new Map<string, BlueprintExportEntry>();
+  for (const b of gridPlan.buildings) {
+    if (b.role === 'junction') continue;
+    const kind: BlueprintExportEntry['kind'] =
+      b.role === 'disposal'
+        ? 'disposal'
+        : b.role === 'input_storage' ||
+            b.role === 'output_storage' ||
+            b.role === 'buffer_storage'
+          ? 'storage'
+          : 'production';
+    const key = `${kind}::${b.prototype}::${b.recipeId ?? ''}::${b.storedProductId ?? ''}`;
+    const existing = entriesMap.get(key);
+    if (existing) {
+      existing.count++;
+    } else {
+      entriesMap.set(key, {
+        machineId: b.machineId ?? b.prototype,
+        machineGameId: b.prototype,
+        machineNameRu:
+          b.role === 'input_storage'
+            ? `Вход: ${b.storedProductNameRu ?? b.machineNameRu}`
+            : b.role === 'output_storage'
+              ? `Выход: ${b.storedProductNameRu ?? b.machineNameRu}`
+              : b.role === 'buffer_storage'
+                ? `Буфер: ${b.storedProductNameRu ?? b.machineNameRu}`
+                : b.machineNameRu,
+        recipeId: b.recipeId,
+        gameRecipeId: b.gameRecipeId,
+        recipeNameRu: b.recipeNameRu,
+        count: 1,
+        kind,
       });
-    }
-  }
-
-  // Optional: Add calculated disposal buildings (flares, smoke stacks, liquid dumps) & buffer storages
-  if (options.includeDisposalBuildings || options.includeBufferStorages) {
-    const adviceList = analyzeByproductsAndStorage(solveResult);
-    const auxCol = depths.length;
-    let auxRow = 0;
-
-    for (const adv of adviceList) {
-      if (
-        options.includeDisposalBuildings &&
-        adv.disposal &&
-        (adv.verdict === 'burn' || adv.verdict === 'vent' || adv.verdict === 'dump')
-      ) {
-        const d = adv.disposal;
-        const gameRecipeId = RECIPE_GAME_IDS[d.recipeId];
-        entries.push({
-          machineId: d.machineId,
-          machineGameId: d.machineGameId,
-          machineNameRu: d.machineName,
-          recipeId: d.recipeId,
-          gameRecipeId,
-          recipeNameRu: d.recipeName,
-          count: d.ceilMachines,
-          kind: 'disposal',
-        });
-        for (let i = 0; i < d.ceilMachines; i++) {
-          planned.push({
-            prototype: d.machineGameId,
-            recipes: gameRecipeId ? [gameRecipeId] : undefined,
-            x: auxCol * 18,
-            y: auxRow++ * 12,
-          });
-        }
-      }
-
-      if (
-        options.includeBufferStorages &&
-        adv.storage &&
-        (adv.verdict === 'store_mandatory' || adv.verdict === 'store_buffer')
-      ) {
-        const st = adv.storage;
-        const stCount = adv.verdict === 'store_mandatory' ? 1 : 1;
-        entries.push({
-          machineId: st.machineId,
-          machineGameId: st.machineGameId,
-          machineNameRu: `${st.machineName} (${adv.name})`,
-          count: stCount,
-          kind: 'storage',
-        });
-        for (let i = 0; i < stCount; i++) {
-          planned.push({
-            prototype: st.machineGameId,
-            x: (auxCol + 1) * 18,
-            y: auxRow++ * 12,
-          });
-        }
-      }
     }
   }
 
@@ -386,18 +467,17 @@ export function encodePlanToGameBlueprint(
   w.writeString('0.8.4');
   w.writeUInt(303);
   w.writeString(planName || 'COI Factory OS');
-  w.writeString('Создано в калькуляторе COI // Factory OS');
-  w.writeUInt(planned.length);
+  w.writeString('Создано в калькуляторе COI // Factory OS (со складами и конвейерами)');
+
+  const totalEntityCount = gridPlan.buildings.length + gridPlan.routes.length;
+  w.writeUInt(totalEntityCount);
 
   let nextId = 1000;
-  for (const ent of planned) {
-    writeEntityConfig(w, {
-      originalId: nextId++,
-      prototype: ent.prototype,
-      recipes: ent.recipes,
-      x: ent.x,
-      y: ent.y,
-    });
+  for (const b of gridPlan.buildings) {
+    writeBuildingEntityConfig(w, nextId++, b);
+  }
+  for (const rt of gridPlan.routes) {
+    writeTransportEntityConfig(w, rt);
   }
 
   // Library v4 trailer matching Blueprint.DeserializeForBlueprints:
@@ -414,10 +494,21 @@ export function encodePlanToGameBlueprint(
   const b64 = uint8ToBase64(compressed);
   return {
     code: `B${b64.length}:${b64}`,
-    entityCount: planned.length,
-    entries,
-    unmappedRecipes,
+    entityCount: totalEntityCount,
+    entries: [...entriesMap.values()],
+    unmappedRecipes: gridPlan.unmappedRecipes,
+    gridPlan,
   };
+}
+
+export function encodePlanToGameBlueprint(
+  solveResult: SolveResult,
+  planName: string,
+  options: BlueprintExportOptions,
+  customPlacements: Record<string, CustomTilePlacement> = {},
+): GeneratedGameBlueprint {
+  const gridPlan = buildCompactGridLayout(solveResult, options, customPlacements);
+  return encodeGridPlanToGameBlueprint(gridPlan, planName);
 }
 
 export interface DecodedMachineGroup {
@@ -441,6 +532,7 @@ export interface DecodedGameBlueprint {
   totalEntities: number;
   transportCount: number;
   machineGroups: DecodedMachineGroup[];
+  gridPlan: CompactGridPlan;
 }
 
 const TRANSPORT_PROTO_PREFIXES = [
@@ -458,6 +550,15 @@ const TRANSPORT_PROTO_PREFIXES = [
   'Slope',
   'TrainLevelCrossing',
 ];
+
+function inferTransportKindFromProto(
+  protoId: string,
+): Exclude<LogisticsSummary['kind'], 'virtual'> {
+  if (protoId.startsWith('Pipe')) return 'fluid';
+  if (protoId.startsWith('Molten')) return 'molten';
+  if (protoId.startsWith('Loose')) return 'loose';
+  return 'flat';
+}
 
 export function decodeGameBlueprint(rawCode: string): DecodedGameBlueprint {
   const trimmed = rawCode.trim();
@@ -483,13 +584,16 @@ export function decodeGameBlueprint(rawCode: string): DecodedGameBlueprint {
   const count = r.readUInt();
 
   const groupsMap = new Map<string, DecodedMachineGroup>();
+  const buildings: PlacedGridBuilding[] = [];
+  const routes: GridTransportRoute[] = [];
   let transportCount = 0;
 
   for (let i = 0; i < count; i++) {
+    const ints: Record<string, number> = {};
     let n = r.readUInt();
     for (let j = 0; j < n; j++) {
-      r.readString();
-      r.readInt();
+      const k = r.readString() ?? '';
+      ints[k] = r.readInt();
     }
     n = r.readUInt();
     for (let j = 0; j < n; j++) {
@@ -511,16 +615,114 @@ export function decodeGameBlueprint(rawCode: string): DecodedGameBlueprint {
       for (let m = 0; m < arrLen; m++) arr.push(r.readString());
       stringArrays[k] = arr;
     }
+    const byteArrays: Record<string, Uint8Array> = {};
     n = r.readUInt();
     for (let j = 0; j < n; j++) {
-      r.readString();
-      r.readByteArray();
+      const k = r.readString() ?? '';
+      byteArrays[k] = r.readByteArray();
     }
 
     const protoId = strings['Prototype'] ?? 'Unknown';
     const isTransport = TRANSPORT_PROTO_PREFIXES.some((pref) =>
       protoId.startsWith(pref),
     );
+
+    if (byteArrays['Trajectory']) {
+      try {
+        const traj = decodeTrajectory(byteArrays['Trajectory']);
+        const kind = inferTransportKindFromProto(protoId);
+        routes.push({
+          id: `dec-rt-${i}`,
+          protoId,
+          iconUrl: getTransportIconForKind(kind, 60),
+          kind,
+          ratePer60: 60,
+          startDir: traj.startDir,
+          endDir: traj.endDir,
+          pivots: traj.pivots,
+          color: ints['TransportColor'] ?? -2139062017,
+          accentColor: ints['TransportAccentColor'] ?? 858993663,
+        });
+      } catch {
+        // skip malformed trajectory
+      }
+    } else if (byteArrays['Transform'] && !protoId.startsWith('LiftIoPort')) {
+      try {
+        const tf = decodeTransform(byteArrays['Transform']);
+        const machine = MACHINE_BY_GAME_ID[protoId];
+        const gameRecipes = (stringArrays['Recipes'] ?? []).filter(
+          (x): x is string => Boolean(x),
+        );
+        const primaryGameRecipe = gameRecipes[0] ?? '';
+        const recipeId = primaryGameRecipe
+          ? GAME_ID_TO_RECIPE_ID[primaryGameRecipe] ?? null
+          : null;
+        const storedProdGameId = strings['StorageStoredProduct'] ?? undefined;
+        const storedProdId = storedProdGameId
+          ? GAME_ID_TO_PRODUCT_ID[storedProdGameId]
+          : undefined;
+        const storedProd = storedProdId ? PRODUCTS[storedProdId] : undefined;
+        const customTitle = strings['CustomTitle'] ?? undefined;
+        const isMiniZip = protoId.startsWith('MiniZip') || protoId.startsWith('Zipper');
+        const box = getBuildingOccupiedBox(
+          protoId,
+          tf.x,
+          tf.y,
+          tf.rotIndex,
+          tf.reflected,
+        );
+        const ports = getBuildingWorldPorts(
+          protoId,
+          tf.x,
+          tf.y,
+          tf.rotIndex,
+          tf.reflected,
+        );
+        buildings.push({
+          id: `dec-b-${i}`,
+          role: isMiniZip
+            ? 'junction'
+            : customTitle?.startsWith('Вход:')
+              ? 'input_storage'
+              : customTitle?.startsWith('Выход:')
+                ? 'output_storage'
+                : 'imported',
+          prototype: protoId,
+          machineId: machine?.id,
+          machineNameRu: machine
+            ? getMachineLabel(machine.id).ru
+            : isMiniZip
+              ? 'Соединитель'
+              : protoId,
+          machineIcon: machine?.icon ?? `${protoId}.png`,
+          recipeId: recipeId ?? undefined,
+          gameRecipeId: primaryGameRecipe || undefined,
+          recipeNameRu: recipeId
+            ? getRecipeLabel(recipeId).ru
+            : primaryGameRecipe || undefined,
+          storedProductId: storedProdId,
+          storedProductGameId: storedProdGameId,
+          storedProductNameRu: storedProdId
+            ? (getProductLabel(storedProdId).ru ?? storedProd?.name)
+            : undefined,
+          storedProductIcon: storedProd?.icon,
+          customTitle,
+          tx: tf.x,
+          ty: tf.y,
+          tz: tf.z,
+          rotIndex: tf.rotIndex,
+          reflected: tf.reflected,
+          minX: box.minX,
+          minY: box.minY,
+          width: box.width,
+          height: box.height,
+          ports,
+        });
+      } catch {
+        // skip transform parse error
+      }
+    }
+
     if (isTransport) {
       transportCount++;
       continue;
@@ -555,6 +757,31 @@ export function decodeGameBlueprint(rawCode: string): DecodedGameBlueprint {
     }
   }
 
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const b of buildings) {
+    if (b.minX < minX) minX = b.minX;
+    if (b.minY < minY) minY = b.minY;
+    if (b.minX + b.width - 1 > maxX) maxX = b.minX + b.width - 1;
+    if (b.minY + b.height - 1 > maxY) maxY = b.minY + b.height - 1;
+  }
+  for (const rt of routes) {
+    for (const [px, py] of rt.pivots) {
+      if (px < minX) minX = px;
+      if (py < minY) minY = py;
+      if (px > maxX) maxX = px;
+      if (py > maxY) maxY = py;
+    }
+  }
+  if (!Number.isFinite(minX)) {
+    minX = 0;
+    minY = 0;
+    maxX = 20;
+    maxY = 20;
+  }
+
   const machineGroups = [...groupsMap.values()].sort(
     (a, b) => b.count - a.count,
   );
@@ -568,6 +795,15 @@ export function decodeGameBlueprint(rawCode: string): DecodedGameBlueprint {
     totalEntities: count,
     transportCount,
     machineGroups,
+    gridPlan: {
+      buildings,
+      routes,
+      bounds: { minX, minY, maxX, maxY },
+      unmappedRecipes: [],
+      inputStoragesCount: buildings.filter((b) => b.role === 'input_storage').length,
+      outputStoragesCount: buildings.filter((b) => b.role === 'output_storage').length,
+      transportCount: routes.length,
+    },
   };
 }
 

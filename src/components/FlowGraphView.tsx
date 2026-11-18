@@ -28,6 +28,7 @@ import {
   Boxes,
   ChevronDown,
   GitBranch,
+  Grid,
   Layers,
   LayoutGrid,
   Maximize2,
@@ -68,8 +69,9 @@ import {
 import { getProducingRecipes } from '../engine/solver';
 import { formatNumber, formatPower, formatRate } from '../utils/format';
 import { cn } from '../utils/cn';
+import { BlueprintGridCanvas } from './BlueprintGridCanvas';
 
-type GraphSubMode = 'dag' | 'bus';
+type GraphSubMode = 'grid' | 'dag' | 'bus';
 
 const MAX_SPLIT_TILES_PER_STEP = 16;
 
@@ -998,7 +1000,7 @@ const FlowGraphInner: React.FC<FlowGraphViewProps> = ({
   onUseRawSource,
   onAddTargetWithRate,
 }) => {
-  const [subMode, setSubMode] = useState<GraphSubMode>('dag');
+  const [subMode, setSubMode] = useState<GraphSubMode>('grid');
   const [direction, setDirection] = useState<'LR' | 'TB'>('LR');
   const [compact, setCompact] = useState<boolean>(true);
   const [splitByBuilding, setSplitByBuilding] = useState<boolean>(true);
@@ -1366,7 +1368,20 @@ const FlowGraphInner: React.FC<FlowGraphViewProps> = ({
     <div className="flex flex-1 flex-col gap-2.5 min-w-0">
       {/* Top Bar */}
       <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/[0.08] bg-[#121214] px-3 py-2">
-        <div className="flex items-center gap-1 rounded-lg border border-white/[0.08] bg-[#09090b] p-0.5">
+        <div className="flex flex-wrap items-center gap-1 rounded-lg border border-white/[0.08] bg-[#09090b] p-0.5">
+          <button
+            type="button"
+            onClick={() => setSubMode('grid')}
+            className={cn(
+              'flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors',
+              subMode === 'grid'
+                ? 'bg-[#18181b] text-emerald-300 ring-1 ring-white/[0.08]'
+                : 'text-zinc-400 hover:text-zinc-200',
+            )}
+          >
+            <Grid className="h-3.5 w-3.5" />
+            <span>Сетка чертежа 1:1 (Как в игре)</span>
+          </button>
           <button
             type="button"
             onClick={() => setSubMode('dag')}
@@ -1391,7 +1406,7 @@ const FlowGraphInner: React.FC<FlowGraphViewProps> = ({
             )}
           >
             <LayoutGrid className="h-3.5 w-3.5" />
-            <span>Компактная схема шин (Цехи и Магистрали)</span>
+            <span>Матрица шин (Цехи и Магистрали)</span>
           </button>
         </div>
 
@@ -1416,7 +1431,14 @@ const FlowGraphInner: React.FC<FlowGraphViewProps> = ({
         </div>
       </div>
 
-      {subMode === 'bus' ? (
+      {subMode === 'grid' ? (
+        <BlueprintGridCanvas
+          plan={plan}
+          solveResult={solveResult}
+          rateUnit={rateUnit}
+          onOpenRecipeModal={openRecipeOrSourceModal}
+        />
+      ) : subMode === 'bus' ? (
         <BusMatrixView
           solveResult={solveResult}
           rateUnit={rateUnit}

@@ -27,6 +27,8 @@ import {
   decodedBlueprintToFactoryPlan,
   encodePlanToGameBlueprint,
 } from '../engine/gameBlueprint';
+import { loadSavedGridPlacements } from './BlueprintGridCanvas';
+import { copyTextToClipboard } from '../utils/clipboard';
 import { cn } from '../utils/cn';
 
 interface ProductPickerModalProps {
@@ -307,14 +309,20 @@ export const BlueprintModal: React.FC<BlueprintModalProps> = ({
   const generatedGameBp = useMemo(() => {
     if (!open) return null;
     try {
-      return encodePlanToGameBlueprint(solveResult, plan.name, {
-        includeDisposalBuildings: includeDisposal,
-        includeBufferStorages: includeStorage,
-      });
+      const customPlacements = loadSavedGridPlacements(plan.id);
+      return encodePlanToGameBlueprint(
+        solveResult,
+        plan.name,
+        {
+          includeDisposalBuildings: includeDisposal,
+          includeBufferStorages: includeStorage,
+        },
+        customPlacements,
+      );
     } catch {
       return null;
     }
-  }, [open, solveResult, plan.name, includeDisposal, includeStorage]);
+  }, [open, solveResult, plan.id, plan.name, includeDisposal, includeStorage]);
 
   const decodedGameBp = useMemo(() => {
     const raw = gameBpInput.trim();
@@ -334,7 +342,7 @@ export const BlueprintModal: React.FC<BlueprintModalProps> = ({
   const exportedJson = JSON.stringify(plan, null, 2);
 
   const handleCopyText = async (txt: string) => {
-    await navigator.clipboard.writeText(txt);
+    await copyTextToClipboard(txt);
     setCopied(true);
     setTimeout(() => setCopied(false), 1800);
   };
@@ -451,9 +459,19 @@ export const BlueprintModal: React.FC<BlueprintModalProps> = ({
                   </p>
                 </div>
                 {generatedGameBp && (
-                  <span className="rounded bg-emerald-500/15 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-300">
-                    {generatedGameBp.entityCount} зд.
-                  </span>
+                  <div className="flex flex-wrap items-center gap-1 font-mono text-[10px]">
+                    <span className="rounded bg-emerald-500/15 px-2 py-0.5 font-semibold text-emerald-300">
+                      {generatedGameBp.gridPlan.buildings.length} зд.
+                    </span>
+                    <span className="rounded bg-sky-500/15 px-2 py-0.5 font-semibold text-sky-300">
+                      {generatedGameBp.gridPlan.inputStoragesCount +
+                        generatedGameBp.gridPlan.outputStoragesCount}{' '}
+                      вх/вых
+                    </span>
+                    <span className="rounded bg-amber-500/15 px-2 py-0.5 font-semibold text-amber-300">
+                      {generatedGameBp.gridPlan.transportCount} конв./труб
+                    </span>
+                  </div>
                 )}
               </div>
 
