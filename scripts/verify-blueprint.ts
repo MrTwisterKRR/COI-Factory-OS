@@ -107,8 +107,81 @@ for (const preset of STARTER_PRESETS) {
   assert.ok(generated.gridPlan.outputStoragesCount > 0, `Expected output storages in ${preset.name}`);
   assert.ok(generated.gridPlan.transportCount > 0, `Expected transport routes in ${preset.name}`);
   assert.equal(roundTrip.gridPlan.routes.length, generated.gridPlan.routes.length);
+
+  // 1. Assert NO WasteDump exists anywhere in generated blueprint (must use StorageFluid tank instead)
+  const wasteDumps = generated.gridPlan.buildings.filter((b) => b.prototype === 'WasteDump');
+  assert.equal(wasteDumps.length, 0, `Found forbidden WasteDump in ${preset.name}`);
+
+  // 2. Assert STRICT material separation: no port is shared by two different productIds
+  const portProducts = new Map<string, Set<string>>();
+  for (const rt of generated.gridPlan.routes) {
+    if (!rt.productId) continue;
+    if (rt.fromBuildingId && rt.fromPortName) {
+      const k = `${rt.fromBuildingId}:${rt.fromPortName}`;
+      const s = portProducts.get(k) ?? new Set<string>();
+      s.add(rt.productId);
+      portProducts.set(k, s);
+    }
+    if (rt.toBuildingId && rt.toPortName) {
+      const k = `${rt.toBuildingId}:${rt.toPortName}`;
+      const s = portProducts.get(k) ?? new Set<string>();
+      s.add(rt.productId);
+      portProducts.set(k, s);
+    }
+  }
+  for (const [pk, prods] of portProducts.entries()) {
+    assert.equal(
+      prods.size,
+      1,
+      `Mixed materials on port ${pk} in ${preset.name}: ${[...prods].join(', ')}`,
+    );
+  }
+
+  // 3. Assert ZERO tile overlap between ground-level entities (buildings + lifts + ground MiniZips)
+  const tileOwner = new Map<string, string>();
+  const bMap = new Map(generated.gridPlan.buildings.map((b) => [b.id, b]));
+  for (const b of generated.gridPlan.buildings) {
+    for (let x = b.minX; x < b.minX + b.width; x++) {
+      for (let y = b.minY; y < b.minY + b.height; y++) {
+        const tk = `${x},${y},${b.tz}`;
+        const prev = tileOwner.get(tk);
+        assert.equal(prev, undefined, `Overlap at ${tk} in ${preset.name}: ${prev} vs ${b.id} (${b.prototype})`);
+        tileOwner.set(tk, `${b.id}(${b.prototype})`);
+      }
+    }
+  }
+
+  // 4. Assert exact Z-elevation consistency for every route vs attached port (and flat Z on non-pipe belts)
+  for (const rt of generated.gridPlan.routes) {
+    const sb = rt.fromBuildingId ? bMap.get(rt.fromBuildingId) : undefined;
+    const db = rt.toBuildingId ? bMap.get(rt.toBuildingId) : undefined;
+    const sp = sb?.ports.find((x) => x.name === rt.fromPortName);
+    const dp = db?.ports.find((x) => x.name === rt.toPortName);
+    assert.ok(sp && dp, `Missing port metadata for ${rt.id} in ${preset.name}`);
+    const p0 = rt.pivots[0];
+    const pLast = rt.pivots[rt.pivots.length - 1];
+    assert.equal(p0[2], sp.connZ, `Start Z mismatch on ${rt.id} (${rt.protoId}) in ${preset.name}: p0[2]=${p0[2]} vs sp.connZ=${sp.connZ}`);
+    assert.equal(pLast[2], dp.connZ, `End Z mismatch on ${rt.id} (${rt.protoId}) in ${preset.name}: pLast[2]=${pLast[2]} vs dp.connZ=${dp.connZ}`);
+    if (rt.kind !== 'fluid') {
+      assert.ok(
+        rt.pivots.every((pt) => pt[2] === p0[2]),
+        `Non-fluid belt ${rt.id} (${rt.protoId}) must stay at constant Z in ${preset.name}`,
+      );
+    }
+  }
+
+  const liftCount = generated.gridPlan.buildings.filter((b) => b.role === 'lift').length;
+  const miniZipCount = generated.gridPlan.buildings.filter((b) => b.role === 'junction').length;
+  const elevatedRoutes = generated.gridPlan.routes.filter((rt) => rt.zLevel > 0).length;
+  const dumpTanks = generated.gridPlan.buildings.filter(
+    (b) => b.role === 'disposal' && b.prototype.startsWith('StorageFluid'),
+  ).length;
+  if (preset.id === 'preset-petrochem') {
+    assert.ok(dumpTanks > 0, 'Expected StorageFluid dump tank in Petrochem preset');
+  }
+  assert.ok(elevatedRoutes > 0, `Expected multi-level routes (zLevel > 0) in ${preset.name}`);
   console.log(
-    `  ✓ Round-trip decoded: ${roundTrip.totalEntities} entities (in=${generated.gridPlan.inputStoragesCount}, out=${generated.gridPlan.outputStoragesCount}, routes=${generated.gridPlan.routes.length}, trailer=${trailerHex})`,
+    `  ✓ Round-trip decoded: ${roundTrip.totalEntities} entities (in=${generated.gridPlan.inputStoragesCount}, out=${generated.gridPlan.outputStoragesCount}, lifts=${liftCount}, miniZip=${miniZipCount}, dumpTanks=${dumpTanks}, elevated=${elevatedRoutes}/${generated.gridPlan.routes.length}, trailer=${trailerHex})`,
   );
 
   if (outDir) {

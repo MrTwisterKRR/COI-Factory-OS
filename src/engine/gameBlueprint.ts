@@ -237,10 +237,11 @@ function writeBuildingEntityConfig(
   const isStorage =
     b.role === 'input_storage' ||
     b.role === 'output_storage' ||
-    b.role === 'buffer_storage';
+    b.role === 'buffer_storage' ||
+    b.prototype.startsWith('Storage');
 
-  if (b.role === 'junction') {
-    // Minimal 1x1 MiniZip junction entity (only OriginalEntityId + Prototype + Transform)
+  if (b.role === 'junction' || b.role === 'lift') {
+    // Minimal MiniZip / Lift IoPortShape entity (OriginalEntityId + Prototype + Transform)
     w.writeUInt(1);
     w.writeString('OriginalEntityId');
     w.writeInt(originalId);
@@ -427,7 +428,7 @@ export function encodeGridPlanToGameBlueprint(
 ): GeneratedGameBlueprint {
   const entriesMap = new Map<string, BlueprintExportEntry>();
   for (const b of gridPlan.buildings) {
-    if (b.role === 'junction') continue;
+    if (b.role === 'junction' || b.role === 'lift') continue;
     const kind: BlueprintExportEntry['kind'] =
       b.role === 'disposal'
         ? 'disposal'
@@ -451,7 +452,9 @@ export function encodeGridPlanToGameBlueprint(
               ? `Выход: ${b.storedProductNameRu ?? b.machineNameRu}`
               : b.role === 'buffer_storage'
                 ? `Буфер: ${b.storedProductNameRu ?? b.machineNameRu}`
-                : b.machineNameRu,
+                : b.role === 'disposal' && b.prototype.startsWith('Storage')
+                  ? `Цистерна под слив: ${b.storedProductNameRu ?? b.machineNameRu}`
+                  : b.machineNameRu,
         recipeId: b.recipeId,
         gameRecipeId: b.gameRecipeId,
         recipeNameRu: b.recipeNameRu,
@@ -631,11 +634,13 @@ export function decodeGameBlueprint(rawCode: string): DecodedGameBlueprint {
       try {
         const traj = decodeTrajectory(byteArrays['Trajectory']);
         const kind = inferTransportKindFromProto(protoId);
+        const maxZ = traj.pivots.reduce((m, p) => Math.max(m, p[2]), 0);
         routes.push({
           id: `dec-rt-${i}`,
           protoId,
           iconUrl: getTransportIconForKind(kind, 60),
           kind,
+          zLevel: maxZ,
           ratePer60: 60,
           startDir: traj.startDir,
           endDir: traj.endDir,
@@ -646,7 +651,7 @@ export function decodeGameBlueprint(rawCode: string): DecodedGameBlueprint {
       } catch {
         // skip malformed trajectory
       }
-    } else if (byteArrays['Transform'] && !protoId.startsWith('LiftIoPort')) {
+    } else if (byteArrays['Transform']) {
       try {
         const tf = decodeTransform(byteArrays['Transform']);
         const machine = MACHINE_BY_GAME_ID[protoId];
@@ -664,6 +669,10 @@ export function decodeGameBlueprint(rawCode: string): DecodedGameBlueprint {
         const storedProd = storedProdId ? PRODUCTS[storedProdId] : undefined;
         const customTitle = strings['CustomTitle'] ?? undefined;
         const isMiniZip = protoId.startsWith('MiniZip') || protoId.startsWith('Zipper');
+        const isLift = protoId.startsWith('LiftIoPort');
+        const isDownLift = isLift && protoId.includes('__');
+        const liftMatch = isLift ? protoId.match(/_(\d+)$/) : null;
+        const liftZ = liftMatch ? Number(liftMatch[1]) : 0;
         const box = getBuildingOccupiedBox(
           protoId,
           tf.x,
@@ -677,24 +686,38 @@ export function decodeGameBlueprint(rawCode: string): DecodedGameBlueprint {
           tf.y,
           tf.rotIndex,
           tf.reflected,
+          tf.z,
         );
         buildings.push({
           id: `dec-b-${i}`,
-          role: isMiniZip
-            ? 'junction'
-            : customTitle?.startsWith('Вход:')
-              ? 'input_storage'
-              : customTitle?.startsWith('Выход:')
-                ? 'output_storage'
-                : 'imported',
+          role: isLift
+            ? 'lift'
+            : isMiniZip
+              ? 'junction'
+              : customTitle?.startsWith('Вход:')
+                ? 'input_storage'
+                : customTitle?.startsWith('Выход:')
+                  ? 'output_storage'
+                  : customTitle?.startsWith('Цистерна под слив:') ||
+                      customTitle?.startsWith('Утилизация:')
+                    ? 'disposal'
+                    : customTitle?.startsWith('Буфер:')
+                      ? 'buffer_storage'
+                      : 'imported',
           prototype: protoId,
           machineId: machine?.id,
           machineNameRu: machine
             ? getMachineLabel(machine.id).ru
-            : isMiniZip
-              ? 'Соединитель'
-              : protoId,
-          machineIcon: machine?.icon ?? `${protoId}.png`,
+            : isLift
+              ? isDownLift
+                ? `Спуск конвейера Z${liftZ}→0`
+                : `Подъёмник конвейера 0→Z${liftZ}`
+              : isMiniZip
+                ? 'Соединитель'
+                : protoId,
+          machineIcon:
+            machine?.icon ??
+            (isLift ? getTransportIconForKind(inferTransportKindFromProto(protoId), 60) : `${protoId}.png`),
           recipeId: recipeId ?? undefined,
           gameRecipeId: primaryGameRecipe || undefined,
           recipeNameRu: recipeId

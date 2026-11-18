@@ -90,6 +90,7 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
   const [tilePx, setTilePx] = useState(22);
   const [pan, setPan] = useState({ x: 24, y: 24 });
   const [showReference, setShowReference] = useState(false);
+  const [zFilter, setZFilter] = useState<'all' | 'z0' | 'z1' | 'z2' | 'z3+'>('all');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hoveredRouteId, setHoveredRouteId] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
@@ -102,6 +103,7 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
   useEffect(() => {
     setCustomPlacements(loadSavedGridPlacements(plan.id));
     setSelectedId(null);
+    setZFilter('all');
   }, [plan.id]);
 
   const persistPlacements = useCallback(
@@ -371,6 +373,21 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
     () => activeGrid.buildings.filter((b) => b.role === 'output_storage'),
     [activeGrid.buildings],
   );
+  const liftCount = useMemo(
+    () => activeGrid.buildings.filter((b) => b.role === 'lift').length,
+    [activeGrid.buildings],
+  );
+
+  const matchesZFilter = useCallback(
+    (z: number) => {
+      if (zFilter === 'all') return true;
+      if (zFilter === 'z0') return z === 0;
+      if (zFilter === 'z1') return z === 1;
+      if (zFilter === 'z2') return z === 2;
+      return z >= 3;
+    },
+    [zFilter],
+  );
 
   return (
     <div className="flex flex-col gap-2.5">
@@ -419,6 +436,30 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
             <span className="rounded border border-amber-500/25 bg-amber-500/10 px-2 py-0.5 text-amber-300">
               Конвейеры/трубы: {activeGrid.transportCount}
             </span>
+            {liftCount > 0 && (
+              <span className="rounded border border-violet-500/25 bg-violet-500/10 px-2 py-0.5 text-violet-300">
+                Подъёмники: {liftCount}
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-1 rounded-lg border border-white/[0.08] bg-[#09090b] p-0.5 font-mono text-[10px]">
+            <span className="px-1.5 text-zinc-500">Уровень:</span>
+            {(['all', 'z0', 'z1', 'z2', 'z3+'] as const).map((zf) => (
+              <button
+                key={zf}
+                type="button"
+                onClick={() => setZFilter(zf)}
+                className={cn(
+                  'rounded px-1.5 py-0.5 transition-colors',
+                  zFilter === zf
+                    ? 'bg-[#18181b] font-semibold text-violet-300 ring-1 ring-violet-500/40'
+                    : 'text-zinc-400 hover:text-zinc-200',
+                )}
+              >
+                {zf === 'all' ? 'Все Z' : zf.toUpperCase()}
+              </button>
+            ))}
           </div>
         </div>
 
@@ -612,20 +653,23 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
                 hoveredRouteId === rt.id ||
                 (selectedId !== null &&
                   (rt.fromBuildingId === selectedId || rt.toBuildingId === selectedId));
+              const matchesZ = matchesZFilter(rt.zLevel ?? 0);
               const mid = getRouteMidpoint(rt);
+              const zBadgeOffset = (rt.zLevel ?? 0) > 0 ? 12 : 0;
 
               return (
                 <g
                   key={rt.id}
                   onMouseEnter={() => setHoveredRouteId(rt.id)}
                   onMouseLeave={() => setHoveredRouteId(null)}
-                  className="cursor-pointer"
+                  opacity={matchesZ ? 1 : 0.14}
+                  className="cursor-pointer transition-opacity duration-150"
                 >
-                  {/* Dark outer casing */}
+                  {/* Dark outer casing (subtle violet/amber aura when elevated Z > 0) */}
                   <polyline
                     points={pts}
                     fill="none"
-                    stroke="#09090b"
+                    stroke={(rt.zLevel ?? 0) > 0 ? '#1e1b2e' : '#09090b'}
                     strokeWidth={Math.max(6, tilePx * 0.42)}
                     strokeLinejoin="round"
                     strokeLinecap="round"
@@ -654,7 +698,7 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
                     strokeDasharray="2 7"
                     strokeLinejoin="round"
                   />
-                  {/* Endpoint arrow */}
+                  {/* Endpoint dot */}
                   {rt.pivots.length >= 2 && (
                     <circle
                       cx={toScreenX(rt.pivots[rt.pivots.length - 1][0] + 0.5)}
@@ -665,16 +709,16 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
                       strokeWidth="1"
                     />
                   )}
-                  {/* Midpoint badge */}
+                  {/* Midpoint badge with transport icon, material icon, rate, and height level (Z1..Z5) */}
                   {mid && tilePx >= 16 && (
                     <g
                       transform={`translate(${mid[0]}, ${mid[1]})`}
-                      opacity={isHighlighted ? 1 : 0.9}
+                      opacity={isHighlighted ? 1 : 0.92}
                     >
                       <rect
-                        x={-24}
+                        x={-24 - zBadgeOffset / 2}
                         y={-9}
-                        width={48}
+                        width={48 + zBadgeOffset}
                         height={18}
                         rx={4}
                         fill="#09090b"
@@ -684,7 +728,7 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
                       />
                       <image
                         href={rt.iconUrl}
-                        x={-21}
+                        x={-21 - zBadgeOffset / 2}
                         y={-7}
                         width={14}
                         height={14}
@@ -692,14 +736,14 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
                       {rt.productIcon ? (
                         <image
                           href={getProductIconUrl(rt.productIcon)}
-                          x={-5}
+                          x={-5 - zBadgeOffset / 2}
                           y={-6}
                           width={12}
                           height={12}
                         />
                       ) : null}
                       <text
-                        x={rt.productIcon ? 9 : -4}
+                        x={(rt.productIcon ? 9 : -4) - zBadgeOffset / 2}
                         y={3}
                         fill="#e4e4e7"
                         fontSize="8.5"
@@ -709,6 +753,19 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
                           ? `${Math.round(rt.ratePer60)}`
                           : rt.protoId.replace('MoltenMetalChannel', 'Жел').replace('Pipe', 'Тр')}
                       </text>
+                      {(rt.zLevel ?? 0) > 0 && (
+                        <text
+                          x={24 + zBadgeOffset / 2 - 2}
+                          y={3}
+                          textAnchor="end"
+                          fill="#c4b5fd"
+                          fontSize="7.5"
+                          fontWeight="700"
+                          fontFamily="ui-monospace, SFMono-Regular, monospace"
+                        >
+                          Z{rt.zLevel}
+                        </text>
+                      )}
                     </g>
                   )}
                 </g>
@@ -732,39 +789,82 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
             const isSelected = selectedId === b.id;
 
             if (b.role === 'junction') {
+              const jMatches = matchesZFilter(b.tz);
               return (
                 <div
                   key={b.id}
                   onPointerDown={(e) => handleBuildingPointerDown(e, b)}
                   style={{ left, top, width, height }}
-                  title={`${b.machineNameRu} (${b.prototype})`}
+                  title={`${b.machineNameRu} (${b.prototype} • Z=${b.tz})`}
                   className={cn(
-                    'absolute flex items-center justify-center rounded border bg-[#18181b]/95 cursor-move',
+                    'absolute flex items-center justify-center rounded border bg-[#18181b]/95 cursor-move transition-opacity',
+                    jMatches ? 'opacity-100' : 'opacity-20',
                     isSelected
                       ? 'border-amber-400 ring-2 ring-amber-400/30'
-                      : 'border-white/25',
+                      : b.tz > 0
+                        ? 'border-violet-400/60'
+                        : 'border-white/25',
                   )}
                 >
-                  <span className="h-2 w-2 rotate-45 bg-amber-400/90" />
+                  {b.tz > 0 && tilePx >= 18 ? (
+                    <span className="font-mono text-[8px] font-bold text-violet-300">
+                      Z{b.tz}
+                    </span>
+                  ) : (
+                    <span className="h-2 w-2 rotate-45 bg-amber-400/90" />
+                  )}
                 </div>
               );
             }
 
+            if (b.role === 'lift') {
+              const liftMatch = b.prototype.match(/_(\d+)$/);
+              const liftZ = liftMatch ? Number(liftMatch[1]) : 1;
+              const isDown = b.prototype.includes('__');
+              const liftMatchesZ =
+                zFilter === 'all' || zFilter === 'z0' || matchesZFilter(liftZ);
+              return (
+                <div
+                  key={b.id}
+                  onPointerDown={(e) => handleBuildingPointerDown(e, b)}
+                  style={{ left, top, width, height }}
+                  title={`${b.machineNameRu} (${b.prototype})${b.storedProductNameRu ? ` • ${b.storedProductNameRu}` : ''}`}
+                  className={cn(
+                    'absolute flex items-center justify-center gap-0.5 rounded border cursor-move transition-opacity',
+                    liftMatchesZ ? 'opacity-100' : 'opacity-25',
+                    isDown
+                      ? 'border-amber-400/75 bg-amber-950/90 text-amber-200'
+                      : 'border-violet-400/75 bg-violet-950/90 text-violet-200',
+                    isSelected && 'ring-2 ring-emerald-400',
+                  )}
+                >
+                  <span className="font-mono text-[9px] font-bold leading-none">
+                    {isDown ? '↓' : '↑'}Z{liftZ}
+                  </span>
+                </div>
+              );
+            }
+
+            const isDumpTank =
+              b.role === 'disposal' && b.prototype.startsWith('StorageFluid');
             const isStorage =
               b.role === 'input_storage' ||
               b.role === 'output_storage' ||
-              b.role === 'buffer_storage';
+              b.role === 'buffer_storage' ||
+              isDumpTank;
 
             const roleStyles =
               b.role === 'input_storage'
                 ? 'border-sky-400/55 bg-[#0c1a27]/95 shadow-[0_0_18px_-6px_rgba(56,189,248,0.35)]'
                 : b.role === 'output_storage'
                   ? 'border-emerald-400/60 bg-[#0b2117]/95 shadow-[0_0_18px_-6px_rgba(16,185,129,0.35)]'
-                  : b.role === 'disposal'
-                    ? 'border-orange-400/50 bg-[#21150b]/95'
-                    : b.role === 'buffer_storage'
-                      ? 'border-amber-400/50 bg-[#201b0c]/95'
-                      : 'border-white/20 bg-[#141418]/95';
+                  : isDumpTank
+                    ? 'border-cyan-400/55 bg-[#091c24]/95 shadow-[0_0_18px_-6px_rgba(34,211,238,0.3)]'
+                    : b.role === 'disposal'
+                      ? 'border-orange-400/50 bg-[#21150b]/95'
+                      : b.role === 'buffer_storage'
+                        ? 'border-amber-400/50 bg-[#201b0c]/95'
+                        : 'border-white/20 bg-[#141418]/95';
 
             const linkedStep = b.stepId ? stepById.get(b.stepId) : undefined;
 
@@ -773,6 +873,11 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
                 key={b.id}
                 onPointerDown={(e) => handleBuildingPointerDown(e, b)}
                 style={{ left, top, width, height }}
+                title={
+                  isDumpTank
+                    ? `${b.customTitle ?? b.machineNameRu} — подключите береговую сливную трубу (WasteDump) к выходу цистерны`
+                    : b.customTitle ?? b.machineNameRu
+                }
                 className={cn(
                   'group absolute overflow-visible rounded-md border transition-shadow duration-150',
                   !showReference ? 'cursor-move' : 'cursor-pointer',
@@ -825,6 +930,10 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
                     <span className="truncate rounded bg-[#09090b]/85 px-1 py-0.2 text-[8px] font-bold uppercase tracking-wider text-emerald-300 ring-1 ring-emerald-500/30">
                       Выход
                     </span>
+                  ) : isDumpTank ? (
+                    <span className="truncate rounded bg-[#09090b]/85 px-1 py-0.2 text-[8px] font-bold uppercase text-cyan-300 ring-1 ring-cyan-500/35">
+                      Под слив
+                    </span>
                   ) : b.role === 'disposal' ? (
                     <span className="truncate rounded bg-[#09090b]/85 px-1 py-0.2 text-[8px] font-bold uppercase text-orange-300 ring-1 ring-orange-500/30">
                       Сброс
@@ -873,7 +982,9 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
                   <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 rounded-b-[5px] bg-[#09090b]/88 px-1 py-0.5 text-center leading-tight">
                     <div className="w-full truncate text-[8.5px] font-semibold text-zinc-100">
                       {isStorage
-                        ? b.storedProductNameRu ?? b.machineNameRu
+                        ? isDumpTank
+                          ? `Слив: ${b.storedProductNameRu ?? b.machineNameRu}`
+                          : b.storedProductNameRu ?? b.machineNameRu
                         : b.machineNameRu}
                     </div>
                     {isStorage && b.flowRatePer60 !== undefined ? (
@@ -882,7 +993,9 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
                           'font-mono text-[8.5px] font-bold tabular-nums',
                           b.role === 'input_storage'
                             ? 'text-sky-300'
-                            : 'text-emerald-300',
+                            : isDumpTank
+                              ? 'text-cyan-300'
+                              : 'text-emerald-300',
                         )}
                       >
                         {b.role === 'input_storage' ? '+' : '→'}
@@ -905,13 +1018,13 @@ export const BlueprintGridCanvas: React.FC<BlueprintGridCanvasProps> = ({
           <div className="rounded-lg border border-white/[0.08] bg-[#121214]/90 px-2.5 py-1 text-[10px] text-zinc-400">
             {showReference
               ? 'Режим просмотра эталонного чертежа игры (B1648 • 83 объекта)'
-              : 'Перетаскивайте здания и склады по тайлам (1:1); выделите объект для поворота 90°'}
+              : 'Разные материалы разведены по уровням Z0–Z5 и портам без смешивания; к цистернам слива подключите сливную трубу на берегу'}
           </div>
           {selectedBuilding && (
             <div className="rounded-lg border border-emerald-500/35 bg-[#121214]/95 px-2.5 py-1 font-mono text-[10px] text-zinc-200">
               {selectedBuilding.machineNameRu} ({selectedBuilding.prototype}) •{' '}
-              поз. ({selectedBuilding.tx}, {selectedBuilding.ty}) • {selectedBuilding.width}×
-              {selectedBuilding.height} • пов. {selectedBuilding.rotIndex * 90}°
+              поз. ({selectedBuilding.tx}, {selectedBuilding.ty}, z={selectedBuilding.tz}) •{' '}
+              {selectedBuilding.width}×{selectedBuilding.height} • пов. {selectedBuilding.rotIndex * 90}°
               {selectedBuilding.storedProductId && (
                 <> • {getProductLabel(selectedBuilding.storedProductId).ru}</>
               )}

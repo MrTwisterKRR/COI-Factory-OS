@@ -28,9 +28,11 @@ export interface WorldPort {
   /** Perimeter tile inside the building */
   tileX: number;
   tileY: number;
+  tileZ: number;
   /** First external tile directly adjacent to this port where transport begins/ends */
   connX: number;
   connY: number;
+  connZ: number;
   /** Outward unit direction pointing from the building out through the port */
   dirX: number;
   dirY: number;
@@ -92,6 +94,27 @@ export function rotateRelVector(
   }
 }
 
+function rotateCoordInBox(
+  rx: number,
+  ry: number,
+  w: number,
+  h: number,
+  rotIndex: number,
+  reflected = false,
+): [number, number] {
+  const ryR = reflected ? h - 1 - ry : ry;
+  switch (normalizeRotIndex(rotIndex)) {
+    case 0:
+      return [rx, ryR];
+    case 1:
+      return [h - 1 - ryR, rx];
+    case 2:
+      return [w - 1 - rx, h - 1 - ryR];
+    case 3:
+      return [ryR, w - 1 - rx];
+  }
+}
+
 export function getBuildingCenterOffset(layout: RawBuildingLayout): {
   cx: number;
   cy: number;
@@ -107,6 +130,7 @@ export function getBuildingCenterOffset(layout: RawBuildingLayout): {
 /**
  * Returns the inclusive tile bounding box `[minX..maxX] × [minY..maxY]`
  * occupied by a building placed at Transform center `(tx, ty)`.
+ * Matches `Mafi.Core.Entities.Static.Layout.EntityLayout.GetCoreOffset / Transform`.
  */
 export function getBuildingOccupiedBox(
   protoId: string,
@@ -116,38 +140,54 @@ export function getBuildingOccupiedBox(
   reflected = false,
 ): OccupiedBox {
   const layout = getRawBuildingLayout(protoId);
-  const { cx, cy } = getBuildingCenterOffset(layout);
-  const corners: [number, number][] = [
-    [0 - cx, 0 - cy],
-    [layout.w - 1 - cx, 0 - cy],
-    [0 - cx, layout.h - 1 - cy],
-    [layout.w - 1 - cx, layout.h - 1 - cy],
-  ];
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const [dx, dy] of corners) {
-    const [rx, ry] = rotateRelVector(dx, dy, rotIndex, reflected);
-    const wx = tx + rx;
-    const wy = ty + ry;
-    if (wx < minX) minX = wx;
-    if (wx > maxX) maxX = wx;
-    if (wy < minY) minY = wy;
-    if (wy > maxY) maxY = wy;
+  const rot = normalizeRotIndex(rotIndex);
+  if (layout.ox !== undefined || layout.oy !== undefined) {
+    const { cx, cy } = getBuildingCenterOffset(layout);
+    const corners: [number, number][] = [
+      [0 - cx, 0 - cy],
+      [layout.w - 1 - cx, 0 - cy],
+      [0 - cx, layout.h - 1 - cy],
+      [layout.w - 1 - cx, layout.h - 1 - cy],
+    ];
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const [dx, dy] of corners) {
+      const [rx, ry] = rotateRelVector(dx, dy, rot, reflected);
+      const wx = tx + rx;
+      const wy = ty + ry;
+      if (wx < minX) minX = wx;
+      if (wx > maxX) maxX = wx;
+      if (wy < minY) minY = wy;
+      if (wy > maxY) maxY = wy;
+    }
+    return {
+      minX,
+      minY,
+      maxX,
+      maxY,
+      width: maxX - minX + 1,
+      height: maxY - minY + 1,
+    };
   }
+
+  const width = rot % 2 === 1 ? layout.h : layout.w;
+  const height = rot % 2 === 1 ? layout.w : layout.h;
+  const minX = tx - Math.floor(width / 2);
+  const minY = ty - Math.floor(height / 2);
   return {
     minX,
     minY,
-    maxX,
-    maxY,
-    width: maxX - minX + 1,
-    height: maxY - minY + 1,
+    maxX: minX + width - 1,
+    maxY: minY + height - 1,
+    width,
+    height,
   };
 }
 
 /**
- * Given a desired top/bottom-left corner `(minX, minY)` on the tile grid,
+ * Given a desired bottom-left corner `(minX, minY)` on the tile grid,
  * computes the exact `Transform` center `(tx, ty)` to write into the blueprint.
  */
 export function minCornerToTransformCenter(
@@ -170,21 +210,68 @@ export function getBuildingWorldPorts(
   ty: number,
   rotIndex = 0,
   reflected = false,
+  tz = 0,
 ): WorldPort[] {
   const layout = getRawBuildingLayout(protoId);
-  const { cx, cy } = getBuildingCenterOffset(layout);
+  const rot = normalizeRotIndex(rotIndex);
+  const box = getBuildingOccupiedBox(protoId, tx, ty, rot, reflected);
+  const liftMatch = protoId.startsWith('LiftIoPortShape_')
+    ? protoId.match(/_(\d+)$/)
+    : null;
+  const liftZ = liftMatch ? Number(liftMatch[1]) : 0;
+
+  if (layout.ox !== undefined || layout.oy !== undefined) {
+    const { cx, cy } = getBuildingCenterOffset(layout);
+    return layout.ports.map((p) => {
+      const [rtx, rty] = rotateRelVector(p.rx - cx, p.ry - cy, rot, reflected);
+      const [rcx, rcy] = rotateRelVector(p.cx - cx, p.cy - cy, rot, reflected);
+      const [rdx, rdy] = rotateRelVector(p.dx, p.dy, rot, reflected);
+      const portZ = tz + (liftZ > 0 && p.n === 'X' ? liftZ : 0);
+      return {
+        name: p.n,
+        kind: p.k,
+        isInput: p.in === 1,
+        tileX: tx + rtx,
+        tileY: ty + rty,
+        tileZ: portZ,
+        connX: tx + rcx,
+        connY: ty + rcy,
+        connZ: portZ,
+        dirX: rdx,
+        dirY: rdy,
+      };
+    });
+  }
+
   return layout.ports.map((p) => {
-    const [rtx, rty] = rotateRelVector(p.rx - cx, p.ry - cy, rotIndex, reflected);
-    const [rcx, rcy] = rotateRelVector(p.cx - cx, p.cy - cy, rotIndex, reflected);
-    const [rdx, rdy] = rotateRelVector(p.dx, p.dy, rotIndex, reflected);
+    const [ltX, ltY] = rotateCoordInBox(
+      p.rx,
+      p.ry,
+      layout.w,
+      layout.h,
+      rot,
+      reflected,
+    );
+    const [lcX, lcY] = rotateCoordInBox(
+      p.cx,
+      p.cy,
+      layout.w,
+      layout.h,
+      rot,
+      reflected,
+    );
+    const [rdx, rdy] = rotateRelVector(p.dx, p.dy, rot, reflected);
+    const portZ = tz + (liftZ > 0 && p.n === 'X' ? liftZ : 0);
     return {
       name: p.n,
       kind: p.k,
       isInput: p.in === 1,
-      tileX: tx + rtx,
-      tileY: ty + rty,
-      connX: tx + rcx,
-      connY: ty + rcy,
+      tileX: box.minX + ltX,
+      tileY: box.minY + ltY,
+      tileZ: portZ,
+      connX: box.minX + lcX,
+      connY: box.minY + lcY,
+      connZ: portZ,
       dirX: rdx,
       dirY: rdy,
     };
